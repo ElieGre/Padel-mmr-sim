@@ -1,4 +1,4 @@
-import PadelMMR from "./PadelMMR.tsx";
+import PadelMMR from "./PadelMMR.jsx";
 
 export default function App() {
   return <PadelMMR />;
