@@ -139,7 +139,7 @@ function calcMmrChanges(teamA, teamB, winner, margin) {
 
   for (const p of lt) {
     const k = p.kFactor;
-    let loss = k * expW * lam * mm;
+    let loss = k * (1.0 - expW) * lam * mm;
     const tm = lt.find((t) => t.id !== p.id);
     if (tm) {
       const ta = Math.max(0.8, Math.min(1.2, 1.0 + ((p.mmr - tm.mmr) / 100) * TEAMMATE_DIFF_FACTOR));
