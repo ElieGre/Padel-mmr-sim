@@ -122,7 +122,7 @@ function calcMmrChanges(teamA, teamB, winner, margin) {
   const mm = MARGIN_MULTIPLIERS[margin] || 1.0;
   const diff = lMmr - wMmr;
   const am = Math.max(MIN_GAIN_MULTIPLIER, Math.min(MAX_GAIN_MULTIPLIER, 1.0 + (diff / 100) * UPSET_BONUS_SCALE));
-  const lam = Math.max(MIN_GAIN_MULTIPLIER, Math.min(MAX_GAIN_MULTIPLIER, 1.0 + (-diff / 100) * UPSET_BONUS_SCALE));
+  const lam = am;
   const changes = {};
 
   for (const p of wt) {
