@@ -1,14 +1,13 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 
 // ─── MMR Engine (V4 Core Logic) ───────────────────────────────────────
-const NUM_PLAYERS = 40;
-const GAMES_PER_PLAYER_TARGET = 100;
-const CALIBRATION_GAMES = 8;
+const NUM_PLAYERS = 44;
+const GAMES_PER_PLAYER_TARGET = 1000;
+const CALIBRATION_GAMES = 10;
 const MMR_START = 1000;
-const BASE_K = 32;
-const K_CALIBRATION = 64;
-const K_VETERAN = 24;
-const K_VETERAN_THRESHOLD = 30;
+const K_MAX = 200;
+const K_MIN = 20;
+const K_DECAY_RATE = 40;
 const UPSET_BONUS_SCALE = 0.6;
 const MAX_GAIN_MULTIPLIER = 2.0;
 const MIN_GAIN_MULTIPLIER = 0.4;
@@ -18,24 +17,12 @@ const TRUE_SKILL_MIN = 10.0;
 const TRUE_SKILL_MAX = 40.0;
 
 const RANK_TIERS = [
-  [0, "Bronze III", "#8B6914", "I"],
-  [600, "Bronze II", "#A07828", "II"],
-  [750, "Bronze I", "#CD9B1D", "III"],
-  [900, "Silver III", "#8A939B", "IV"],
-  [1000, "Silver II", "#A8B4BE", "V"],
-  [1100, "Silver I", "#C0CDD8", "VI"],
-  [1250, "Gold III", "#B8860B", "VII"],
-  [1400, "Gold II", "#DAA520", "VIII"],
-  [1550, "Gold I", "#FFD700", "IX"],
-  [1700, "Plat III", "#4A8B8B", "X"],
-  [1850, "Plat II", "#5CACAC", "XI"],
-  [2000, "Plat I", "#7FFFFF", "XII"],
-  [2200, "Dia III", "#4169E1", "XIII"],
-  [2400, "Dia II", "#6495ED", "XIV"],
-  [2600, "Dia I", "#87CEEB", "XV"],
-  [2800, "Champion", "#DA70D6", "XVI"],
-  [3000, "Grand Champ", "#FF4500", "XVII"],
-  [3500, "Legend", "#FF0000", "XVIII"],
+  [0,    "F",  "#CD5C5C", "F"],
+  [350,  "D",  "#CD853F", "D"],
+  [700,  "C",  "#4169E1", "C"],
+  [1100, "B",  "#32CD32", "B"],
+  [1500, "A",  "#FFD700", "A"],
+  [1900, "A+", "#FF4500", "A+"],
 ];
 
 const NAMES = [
@@ -43,7 +30,8 @@ const NAMES = [
   "Pablo", "Elena", "Karim", "Leila", "Marco", "Ana", "Hassan", "Marta",
   "Diego", "Clara", "Sami", "Yasmin", "Jorge", "Lucia", "Rami", "Sara",
   "Mateo", "Julia", "Fadi", "Rita", "Elie", "Maya", "Leo", "Ines",
-  "Alex", "Dina", "Hugo", "Layla", "Rayan", "Nour", "Tomas", "Zara"
+  "Alex", "Dina", "Hugo", "Layla", "Rayan", "Nour", "Tomas", "Zara",
+  "Sam", "Nina", "Felix", "Petra"
 ];
 
 function getRank(mmr) {
@@ -66,45 +54,32 @@ function seededRandom(seed) {
   };
 }
 
-function gaussianRandom(rng) {
-  let u = 0, v = 0;
-  while (u === 0) u = rng();
-  while (v === 0) v = rng();
-  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-}
 
-function createPlayer(id, name, trueSkill) {
+function createPlayer(id, name, trueSkill, startMmr = 0) {
   return {
     id,
     name,
     trueSkill,
-    mmr: MMR_START,
+    mmr: startMmr,
+    startMmr,
     gamesPlayed: 0,
     wins: 0,
     losses: 0,
     streak: 0,
-    peakMmr: MMR_START,
+    peakMmr: startMmr,
     recentOpponents: [],
     history: [],
     get isProvisional() {
       return this.gamesPlayed < CALIBRATION_GAMES;
     },
     get kFactor() {
-      if (this.gamesPlayed < CALIBRATION_GAMES) {
-        const p = this.gamesPlayed / CALIBRATION_GAMES;
-        return K_CALIBRATION - (K_CALIBRATION - BASE_K) * p;
-      } else if (this.gamesPlayed >= K_VETERAN_THRESHOLD) {
-        return K_VETERAN;
-      } else {
-        const p = (this.gamesPlayed - CALIBRATION_GAMES) / (K_VETERAN_THRESHOLD - CALIBRATION_GAMES);
-        return BASE_K - (BASE_K - K_VETERAN) * p;
-      }
+      return K_MIN + (K_MAX - K_MIN) * Math.exp(-this.gamesPlayed / K_DECAY_RATE);
     },
     get rank() {
       return getRank(this.mmr);
     },
     get trueMmr() {
-      return 200 + ((this.trueSkill - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 1800;
+      return ((this.trueSkill - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 2000;
     },
     get winRate() {
       return this.gamesPlayed > 0 ? ((this.wins / this.gamesPlayed) * 100).toFixed(0) : "0";
@@ -115,7 +90,7 @@ function createPlayer(id, name, trueSkill) {
 function simulateMatch(teamA, teamB, rng) {
   const a = teamA.reduce((s, p) => s + p.trueSkill, 0);
   const b = teamB.reduce((s, p) => s + p.trueSkill, 0);
-  const pa = 1 / (1 + Math.pow(10, (b - a) / (400 / 15)));
+  const pa = 1 / (1 + Math.pow(10, (b - a) / 12));
   return rng() < pa ? 0 : 1;
 }
 
@@ -241,22 +216,32 @@ function runSimulation(seed = 42) {
   const rng = seededRandom(seed);
   const skills = [];
 
-  for (let i = 0; i < NUM_PLAYERS; i++) {
-    const r = rng();
-    const tier = r < 0.25 ? "b" : r < 0.75 ? "i" : "a";
-    const means = { b: 15, i: 25, a: 35 };
-    const stds = { b: 2.5, i: 3, a: 2.5 };
-    let s = means[tier] + gaussianRandom(rng) * stds[tier];
-    s = Math.max(TRUE_SKILL_MIN, Math.min(TRUE_SKILL_MAX, s));
-    skills.push(s);
+  // Exact pool: 3A 7B 14C 15D 5F = 44 players
+  const gradeConfig = [
+    { count: 3,  min: 33, max: 40 },  // A
+    { count: 7,  min: 26, max: 33 },  // B
+    { count: 14, min: 20, max: 26 },  // C
+    { count: 15, min: 14, max: 20 },  // D
+    { count: 5,  min: 10, max: 14 },  // F
+  ];
+  for (const g of gradeConfig) {
+    for (let j = 0; j < g.count; j++) {
+      let s = g.min + rng() * (g.max - g.min);
+      skills.push(Math.max(TRUE_SKILL_MIN, Math.min(TRUE_SKILL_MAX, s)));
+    }
+  }
+  // Fisher-Yates shuffle
+  for (let i = skills.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [skills[i], skills[j]] = [skills[j], skills[i]];
   }
 
-  const players = skills.map((s, i) => createPlayer(i, NAMES[i], s));
+  const players = skills.map((s, i) => createPlayer(i, NAMES[i], s, MMR_START));
   const matches = [];
   let gc = 0;
   let cp = 0;
 
-  while (gc < 500) {
+  while (gc < 10000) {
     const avg = players.reduce((s, p) => s + p.gamesPlayed, 0) / players.length;
     if (avg >= GAMES_PER_PLAYER_TARGET) break;
 
@@ -316,61 +301,46 @@ function RankBadge({ mmr, size = 32 }) {
   const tierGroup = name.split(" ")[0];
 
   const shapes = {
-    Bronze: (
+    F: (
+      <g>
+        <circle cx="16" cy="16" r="12" fill="none" stroke={color} strokeWidth="2" opacity="0.5" />
+        <line x1="10" y1="10" x2="22" y2="22" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
+        <line x1="22" y1="10" x2="10" y2="22" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
+      </g>
+    ),
+    D: (
       <g>
         <circle cx="16" cy="16" r="12" fill="none" stroke={color} strokeWidth="2" opacity="0.6" />
-        <circle cx="16" cy="16" r="6" fill={color} opacity="0.8" />
+        <circle cx="16" cy="16" r="6" fill={color} opacity="0.7" />
       </g>
     ),
-    Silver: (
+    C: (
       <g>
-        <polygon points="16,4 20,14 16,12 12,14" fill={color} opacity="0.8" />
-        <polygon points="16,28 20,18 16,20 12,18" fill={color} opacity="0.8" />
-        <circle cx="16" cy="16" r="4" fill={color} />
+        <polygon points="16,2 28,16 16,30 4,16" fill="none" stroke={color} strokeWidth="2" opacity="0.6" />
+        <polygon points="16,8 22,16 16,24 10,16" fill={color} opacity="0.85" />
       </g>
     ),
-    Gold: (
+    B: (
       <g>
-        <polygon points="16,2 20,12 28,12 22,18 24,28 16,22 8,28 10,18 4,12 12,12" fill={color} opacity="0.9" />
+        <polygon points="16,2 20,12 30,12 22,18 25,28 16,22 7,28 10,18 2,12 12,12" fill={color} opacity="0.9" />
       </g>
     ),
-    Plat: (
-      <g>
-        <polygon points="16,3 19,13 29,13 21,19 24,29 16,23 8,29 11,19 3,13 13,13" fill="none" stroke={color} strokeWidth="1.5" />
-        <polygon points="16,8 18,14 24,14 19,18 21,24 16,20 11,24 13,18 8,14 14,14" fill={color} opacity="0.8" />
-      </g>
-    ),
-    Dia: (
+    A: (
       <g>
         <polygon points="16,2 28,16 16,30 4,16" fill={color} opacity="0.3" />
         <polygon points="16,6 24,16 16,26 8,16" fill={color} opacity="0.7" />
         <polygon points="16,10 20,16 16,22 12,16" fill={color} />
       </g>
     ),
-    Champion: (
+    "A+": (
       <g>
-        <polygon points="16,1 20,11 30,11 22,18 25,28 16,22 7,28 10,18 2,11 12,11" fill={color} />
-        <circle cx="16" cy="14" r="3" fill="#fff" opacity="0.5" />
-      </g>
-    ),
-    Grand: (
-      <g>
-        <polygon points="16,0 19,10 30,10 21,17 24,28 16,21 8,28 11,17 2,10 13,10" fill="#FF4500" />
-        <polygon points="16,5 18,12 24,12 19,16 21,23 16,19 11,23 13,16 8,12 14,12" fill="#FFD700" />
-      </g>
-    ),
-    Legend: (
-      <g>
-        <circle cx="16" cy="16" r="14" fill="none" stroke="#FF0000" strokeWidth="2">
-          <animateTransform attributeName="transform" type="rotate" from="0 16 16" to="360 16 16" dur="8s" repeatCount="indefinite" />
-        </circle>
-        <polygon points="16,2 20,12 30,12 22,18 25,28 16,22 7,28 10,18 2,12 12,12" fill="#FF0000" />
-        <polygon points="16,7 18,13 24,13 19,17 21,23 16,19 11,23 13,17 8,13 14,13" fill="#FFD700" />
+        <polygon points="16,0 19,10 30,10 21,17 24,28 16,21 8,28 11,17 2,10 13,10" fill={color} />
+        <polygon points="16,5 18,12 24,12 19,16 21,23 16,19 11,23 13,16 8,12 14,12" fill="#fff" opacity="0.4" />
       </g>
     ),
   };
 
-  const shape = shapes[tierGroup] || shapes.Bronze;
+  const shape = shapes[tierGroup] || shapes.F;
 
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" style={{ flexShrink: 0 }}>
@@ -1183,7 +1153,7 @@ body {
 `;
 
 // ─── Full-width MMR Chart using Canvas ────────────────────────────────
-function MmrChart({ history, trueMmr }) {
+function MmrChart({ history, trueMmr, startMmr = 0 }) {
   const canvasRef = useRef(null);
 
   useEffect(() => {
@@ -1203,7 +1173,7 @@ function MmrChart({ history, trueMmr }) {
     const pad = { top: 20, right: 26, bottom: 28, left: 50 };
 
     const mmrs = history.map((d) => d.mmr);
-    const allVals = [...mmrs, trueMmr, MMR_START];
+    const allVals = [...mmrs, trueMmr, startMmr];
     const minV = Math.min(...allVals) - 30;
     const maxV = Math.max(...allVals) + 30;
     const rangeV = maxV - minV || 1;
@@ -1246,7 +1216,7 @@ function MmrChart({ history, trueMmr }) {
     ctx.textAlign = "left";
     ctx.fillText("TRUE", W - pad.right + 4, trueY + 3);
 
-    const startY = toY(MMR_START);
+    const startY = toY(startMmr);
     ctx.setLineDash([2, 4]);
     ctx.strokeStyle = "rgba(138,143,168,0.2)";
     ctx.lineWidth = 1;
@@ -1257,7 +1227,7 @@ function MmrChart({ history, trueMmr }) {
     ctx.setLineDash([]);
 
     const last = mmrs[mmrs.length - 1];
-    const lineColor = last >= MMR_START ? "#22c55e" : "#ef4444";
+    const lineColor = last >= startMmr ? "#22c55e" : "#ef4444";
     ctx.strokeStyle = lineColor;
     ctx.lineWidth = 2;
     ctx.lineJoin = "round";
@@ -1273,7 +1243,7 @@ function MmrChart({ history, trueMmr }) {
     ctx.stroke();
 
     const gradient = ctx.createLinearGradient(0, toY(maxV), 0, toY(minV));
-    gradient.addColorStop(0, last >= MMR_START ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)");
+    gradient.addColorStop(0, last >= startMmr ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)");
     gradient.addColorStop(1, "rgba(0,0,0,0)");
 
     ctx.fillStyle = gradient;
@@ -1327,6 +1297,24 @@ export default function PadelMMR() {
   const predAcc = totalMatches > 0 ? ((correctPredictions / totalMatches) * 100).toFixed(1) : "0";
   const mmrSpread = Math.round(Math.max(...players.map((p) => p.mmr)) - Math.min(...players.map((p) => p.mmr)));
 
+  const GRADE_BANDS = [
+    { label: "A+", min: 1900, color: "#FF4500" },
+    { label: "A",  min: 1500, color: "#FFD700" },
+    { label: "B",  min: 1100, color: "#32CD32" },
+    { label: "C",  min: 700,  color: "#4169E1" },
+    { label: "D",  min: 350,  color: "#CD853F" },
+    { label: "F",  min: 0,    color: "#CD5C5C" },
+  ];
+  const gradeCounts = useMemo(() => {
+    const counts = {};
+    for (const g of GRADE_BANDS) counts[g.label] = 0;
+    for (const p of players) {
+      const g = [...GRADE_BANDS].find(g => p.mmr >= g.min) || GRADE_BANDS[GRADE_BANDS.length - 1];
+      counts[g.label]++;
+    }
+    return counts;
+  }, [players]);
+
   const viewPlayer = (p) => {
     setSelectedPlayer(p);
     setTab("profile");
@@ -1361,6 +1349,15 @@ export default function PadelMMR() {
             <div className="hero-stat-value">{mmrSpread}</div>
             <div className="hero-stat-label">MMR Spread</div>
           </div>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "center", gap: 8, marginTop: 20, flexWrap: "wrap" }}>
+          {GRADE_BANDS.map((g) => (
+            <div key={g.label} style={{ textAlign: "center", minWidth: 48 }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: g.color }}>{gradeCounts[g.label]}</div>
+              <div style={{ fontSize: 11, color: g.color, opacity: 0.7, letterSpacing: 1 }}>{g.label}</div>
+            </div>
+          ))}
         </div>
       </div>
 
@@ -1522,7 +1519,7 @@ export default function PadelMMR() {
           }
 
           const [, rankName, rankColor] = p.rank;
-          const delta = p.mmr - MMR_START;
+          const delta = p.mmr - p.startMmr;
           const playerMatches = matches
             .filter((m) => m.teamA.some((t) => t.id === p.id) || m.teamB.some((t) => t.id === p.id))
             .reverse();
@@ -1614,7 +1611,7 @@ export default function PadelMMR() {
                   <div className="profile-chart-title">
                     MMR History <span style={{ opacity: 0.5 }}>(dashed = true skill target)</span>
                   </div>
-                  <MmrChart history={p.history} trueMmr={p.trueMmr} />
+                  <MmrChart history={p.history} trueMmr={p.trueMmr} startMmr={p.startMmr} />
                 </div>
               </div>
 
@@ -1782,390 +1779,233 @@ export default function PadelMMR() {
               <div className="how-card">
                 <h4>What this page is showing</h4>
                 <p>
-                  This page is a simulation of a padel rating system. It creates players,
-                  gives each player a hidden skill level, simulates many matches, and then
-                  updates each player's MMR after every result.
+                  This page is a simulation of a padel rating system. It creates {NUM_PLAYERS} players,
+                  assigns each a hidden skill level, simulates matches, and updates each
+                  player's MMR after every result.
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  The goal of the system is simple: players who consistently perform better
-                  over time should move higher, and players who perform worse over time
-                  should move lower. The more matches that are played, the more stable and
-                  fair the ratings become.
+                  The goal is simple: players who consistently perform better should rise,
+                  and players who perform worse should drop. The more matches played, the
+                  more accurate and stable the ratings become.
                 </p>
               </div>
               <div className="how-card">
-                <h4>What “simulation” means here</h4>
+                <h4>What "simulation" means here</h4>
                 <p>
                   Nothing on this page is typed in by hand. The leaderboard, match history,
-                  win rates, streaks, and charts are generated by code.
+                  win rates, streaks, and charts are all generated by code. Each run:
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  Each time the simulation runs, it:
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  1. Creates a pool of players.<br />
-                  2. Gives each player a hidden skill value.<br />
-                  3. Pairs players into teams and matches.<br />
-                  4. Simulates match results.<br />
-                  5. Updates MMR after every match.<br />
-                  6. Repeats until the target number of games is reached.
+                  1. Creates a pool of {NUM_PLAYERS} players with realistic skill distribution.<br />
+                  2. Assigns each a hidden true skill value (A through F grade).<br />
+                  3. All players start at <code>{MMR_START}</code> MMR.<br />
+                  4. Players are paired into 2v2 matches by MMR proximity.<br />
+                  5. Match outcomes are decided by hidden true skill.<br />
+                  6. MMR updates after every match.<br />
+                  7. Repeats for ~{GAMES_PER_PLAYER_TARGET} games per player.
                 </p>
               </div>
               <div className="how-card">
                 <h4>Why use MMR</h4>
                 <p>
-                  MMR stands for Matchmaking Rating. It is a number that estimates how strong
-                  a player is based on actual results over time.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  Systems like this are commonly used in competitive games, including Dota,
-                  because they adjust ratings continuously instead of placing players into a
-                  fixed level forever. This makes the system more flexible and usually fairer,
-                  especially once enough matches have been played.
+                  MMR (Matchmaking Rating) estimates how strong a player is based on results
+                  over time. It adjusts continuously rather than locking players into a fixed
+                  level. The more matches played, the more accurate the estimate becomes.
                 </p>
               </div>
             </div>
 
             <div className="how-section">
-              <div className="how-title">Key Terms</div>
+              <div className="how-title">Grade Bands</div>
               <div className="how-card">
-                <h4>MMR</h4>
+                <h4>MMR ranges map to grades</h4>
                 <p>
-                  MMR is the visible rating number shown beside each player. A higher MMR
-                  means the system currently believes that player is stronger.
+                  Instead of named tiers, this system uses letter grades with fixed MMR
+                  thresholds that reflect real padel skill distribution:
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  In this simulation, every player starts at <code>{MMR_START}</code>. After
-                  that, their MMR goes up when they win and goes down when they lose.
+                  • <strong style={{ color: "#FF4500" }}>A+</strong> — 1900+ MMR<br />
+                  • <strong style={{ color: "#FFD700" }}>A</strong> — 1500–1900 MMR<br />
+                  • <strong style={{ color: "#32CD32" }}>B</strong> — 1100–1500 MMR<br />
+                  • <strong style={{ color: "#4169E1" }}>C</strong> — 700–1100 MMR<br />
+                  • <strong style={{ color: "#CD853F" }}>D</strong> — 350–700 MMR<br />
+                  • <strong style={{ color: "#CD5C5C" }}>F</strong> — 0–350 MMR
+                </p>
+                <p style={{ marginTop: 12 }}>
+                  The spread should emerge naturally from the simulation — not because
+                  players are placed into grades, but because better players win more and
+                  accumulate more MMR over time.
                 </p>
               </div>
+            </div>
 
+            <div className="how-section">
+              <div className="how-title">Key Mechanics</div>
               <div className="how-card">
                 <h4>True Skill</h4>
                 <p>
-                  True Skill is the hidden skill level used internally by the simulation.
-                  It is not the same as MMR.
+                  True Skill is the hidden ability assigned to each player at the start.
+                  It never changes. It is only used to decide who wins each match —
+                  the rating system itself never sees it.
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  True Skill is the player's actual underlying ability in the simulated world.
-                  MMR is the system's estimate of that ability based only on match results.
+                  The player pool is distributed like a real padel community:<br />
+                  • A grade: ~5% of players<br />
+                  • B grade: ~20%<br />
+                  • C grade: ~35%<br />
+                  • D grade: ~30%<br />
+                  • F grade: ~10%
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  A good rating system should make MMR move closer and closer to a player's
-                  True Skill as more games are played.
+                  A good rating system should make MMR converge toward each player's true
+                  level as more games are played.
                 </p>
               </div>
 
               <div className="how-card">
-                <h4>Calibration / Provisional Status</h4>
+                <h4>K-Factor — Exponential Decay</h4>
                 <p>
-                  New players do not have enough match data yet, so the system is less
-                  certain about their rating.
+                  K-Factor controls how much MMR can change per match. This system uses a
+                  smooth exponential decay instead of hard steps:
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  During the first <code>{CALIBRATION_GAMES}</code> games, players are
-                  treated as provisional. That means their MMR can move more quickly so the
-                  system can find the correct level faster.
-                </p>
-              </div>
-
-              <div className="how-card">
-                <h4>K-Factor</h4>
-                <p>
-                  K-Factor controls how much a player's MMR is allowed to change after a match.
+                  <code>K = {K_MIN} + {K_MAX - K_MIN} x e^(-games / {K_DECAY_RATE})</code>
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  A high K-Factor means the rating moves more. A low K-Factor means the
-                  rating moves less.
+                  In practice this means:
                 </p>
-                <p style={{ marginTop: 12 }}>
-                  In simple terms:
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  • High K = faster adjustment<br />
-                  • Low K = more stable rating
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  This system starts players with a high K-Factor and reduces it over time.
-                  That way, new players can find their level quickly, while experienced
-                  players get more stable ratings.
-                </p>
-
                 <div className="k-bar-container">
                   {[
-                    { label: "Start", k: K_CALIBRATION, color: "var(--accent)" },
-                    { label: `Game ${CALIBRATION_GAMES}`, k: BASE_K, color: "var(--green)" },
-                    { label: `Game ${K_VETERAN_THRESHOLD}+`, k: K_VETERAN, color: "var(--blue)" },
+                    { label: "Game 0", k: K_MAX, color: "var(--accent)" },
+                    { label: "Game 30", k: Math.round(K_MIN + (K_MAX - K_MIN) * Math.exp(-1)), color: "var(--green)" },
+                    { label: "Game 100", k: Math.round(K_MIN + (K_MAX - K_MIN) * Math.exp(-100 / K_DECAY_RATE)), color: "var(--blue)" },
                   ].map((item) => (
                     <div key={item.label} className="k-bar-row">
                       <div className="k-bar-label">{item.label}</div>
                       <div
                         className="k-bar"
                         style={{
-                          width: `${(item.k / K_CALIBRATION) * 220}px`,
+                          width: `${(item.k / K_MAX) * 220}px`,
                           background: item.color,
                         }}
                       />
-                      <div className="k-bar-value">{item.k.toFixed(0)}</div>
+                      <div className="k-bar-value">{item.k}</div>
                     </div>
                   ))}
                 </div>
-              </div>
-
-              <div className="how-card">
-                <h4>Expected Result</h4>
-                <p>
-                  Before each match, the system compares the average MMR of both teams and
-                  calculates which team is expected to win.
-                </p>
                 <p style={{ marginTop: 12 }}>
-                  If a stronger team wins, the result is considered expected, so the rating
-                  change is smaller.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  If a weaker team wins, the result is considered an upset, so the rating
-                  change is larger.
+                  New players are volatile — their MMR moves fast so the system can find
+                  their level quickly. Experienced players are stable — small changes reflect
+                  genuine performance shifts.
                 </p>
               </div>
 
               <div className="how-card">
-                <h4>Upset Bonus</h4>
+                <h4>Provisional Status</h4>
                 <p>
-                  The upset bonus increases rating gains when a lower-rated team beats a
-                  higher-rated team.
+                  Players are considered provisional for their first <code>{CALIBRATION_GAMES}</code> games.
+                  During this window their K is at its highest, so the system can place them
+                  quickly without locking them into an inaccurate rating early on.
+                </p>
+              </div>
+
+              <div className="how-card">
+                <h4>Expected Result & Upset Bonus</h4>
+                <p>
+                  Before each match the system calculates which team is expected to win based
+                  on average MMR. If the favourite wins, the MMR change is smaller. If the
+                  underdog wins, the change is larger.
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  This matters because not all wins mean the same thing. Beating a team that
-                  was already expected to lose is less informative than beating a team that
-                  was expected to win.
+                  This is the Elo principle: beating stronger opponents is worth more than
+                  beating weaker ones.
                 </p>
               </div>
 
               <div className="how-card">
                 <h4>Score Margin</h4>
                 <p>
-                  Score margin means how convincing the win was.
+                  How convincingly you win also matters. A dominant result changes MMR more
+                  than a narrow one — it carries more information about the real skill gap.
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  In this model, a very one-sided result changes MMR more than a very close
-                  result. The idea is that a dominant win provides a stronger signal than a
-                  narrow win.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  The current multipliers are:
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  • Stomp = <code>{MARGIN_MULTIPLIERS.stomp}x</code><br />
-                  • Clear win = <code>{MARGIN_MULTIPLIERS.clear}x</code><br />
+                  • Stomp (8+ point diff) = <code>{MARGIN_MULTIPLIERS.stomp}x</code><br />
+                  • Clear win (4+ diff) = <code>{MARGIN_MULTIPLIERS.clear}x</code><br />
                   • Normal win = <code>{MARGIN_MULTIPLIERS.normal}x</code><br />
-                  • Close win = <code>{MARGIN_MULTIPLIERS.close}x</code>
+                  • Close win (≤2 diff) = <code>{MARGIN_MULTIPLIERS.close}x</code>
                 </p>
               </div>
 
               <div className="how-card">
                 <h4>Teammate Adjustment</h4>
                 <p>
-                  This system also looks at the MMR difference between teammates.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  If a player wins while paired with a weaker teammate, that player may gain
-                  slightly more rating. If a player wins while paired with a stronger
-                  teammate, that player may gain slightly less.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  This is meant to reflect how difficult the win was relative to the help a
-                  player had on their own team.
+                  The system also factors in the MMR gap between teammates. Winning while
+                  carrying a weaker partner gives a slight bonus. Winning with a stronger
+                  partner gives slightly less — the win was partly credited to them.
                 </p>
               </div>
 
               <div className="how-card">
-                <h4>Streak</h4>
+                <h4>Streak Bonus</h4>
                 <p>
-                  A streak is a record of consecutive wins or consecutive losses.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  In this simulation, winning streaks can add a small bonus to gains, while
-                  long losing streaks can slightly reduce losses. This softens extreme rating
-                  swings and helps the system react to recent form without letting it dominate
-                  the whole rating model.
-                </p>
-              </div>
-
-              <div className="how-card">
-                <h4>Veteran Threshold</h4>
-                <p>
-                  After <code>{K_VETERAN_THRESHOLD}</code> games, the player is treated as
-                  more established.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  At that point, the K-Factor becomes smaller and the player's MMR becomes
-                  harder to move. That does not mean the rating is locked. It only means the
-                  system is more confident in that rating.
+                  Winning streaks add a small MMR bonus per win. Long losing streaks slightly
+                  reduce the MMR lost. This softens extreme swings and gives the system a
+                  small sensitivity to recent form.
                 </p>
               </div>
             </div>
 
             <div className="how-section">
-              <div className="how-title">What the Variables Mean</div>
-              <div className="how-card">
-                <h4>Main values used in this build</h4>
-                <p>
-                  <code>NUM_PLAYERS = {NUM_PLAYERS}</code><br />
-                  Total number of simulated players.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>GAMES_PER_PLAYER_TARGET = {GAMES_PER_PLAYER_TARGET}</code><br />
-                  Target average number of games per player before the simulation stops.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>MMR_START = {MMR_START}</code><br />
-                  Starting rating for every player.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>K_CALIBRATION = {K_CALIBRATION}</code><br />
-                  High early K-Factor used while the system is still learning where a new
-                  player belongs.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>BASE_K = {BASE_K}</code><br />
-                  Standard mid-stage K-Factor.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>K_VETERAN = {K_VETERAN}</code><br />
-                  Lower K-Factor used once a player has a large enough match history.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>K_VETERAN_THRESHOLD = {K_VETERAN_THRESHOLD}</code><br />
-                  Number of games after which a player is treated as a veteran.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>UPSET_BONUS_SCALE = {UPSET_BONUS_SCALE}</code><br />
-                  Controls how much extra reward is given for beating stronger opposition.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  <code>TEAMMATE_DIFF_FACTOR = {TEAMMATE_DIFF_FACTOR}</code><br />
-                  Controls how much teammate strength affects the final rating change.
-                </p>
-              </div>
-            </div>
-
-            <div className="how-section">
-              <div className="how-title">How to Read Each Part of the Page</div>
+              <div className="how-title">How to Read the Page</div>
               <div className="how-card">
                 <h4>Leaderboard</h4>
                 <p>
-                  The leaderboard shows the current rating order from highest MMR to lowest
-                  MMR.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  It includes:
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  • MMR = current rating<br />
-                  • Rank = label/tier based on MMR<br />
-                  • Record = wins and losses<br />
-                  • WR% = win rate percentage<br />
-                  • Streak = current consecutive wins or losses<br />
-                  • Trend = mini-chart of recent MMR movement
+                  Ranked from highest to lowest MMR. Each row shows:<br />
+                  • MMR — current rating<br />
+                  • Rank — letter grade based on MMR band<br />
+                  • Record — wins / losses<br />
+                  • WR% — win rate<br />
+                  • Streak — current consecutive wins or losses<br />
+                  • Trend — sparkline of recent MMR movement
                 </p>
               </div>
-
               <div className="how-card">
                 <h4>Player Profile</h4>
                 <p>
-                  Clicking a player opens a more detailed profile.
+                  Click any player to open their full profile: current MMR, peak MMR,
+                  games played, win/loss record, current K-Factor, full MMR history chart,
+                  and recent match-by-match changes.
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  That view shows:
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  • Current MMR<br />
-                  • Peak MMR<br />
-                  • Number of games played<br />
-                  • Win/loss record<br />
-                  • Current K-Factor<br />
-                  • MMR history chart<br />
-                  • Recent match-by-match changes
+                  The dashed line on the chart is the player's True Skill target. If the
+                  system is working, the MMR line should trend toward it over time.
                 </p>
               </div>
-
-              <div className="how-card">
-                <h4>MMR History Chart</h4>
-                <p>
-                  The chart in the profile shows how a player's MMR changed over time.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  The dashed line represents the hidden True Skill target in the simulation.
-                  If the rating system is working well, the player's visible MMR should move
-                  closer to that dashed line as more games are played.
-                </p>
-              </div>
-
               <div className="how-card">
                 <h4>Match History</h4>
                 <p>
-                  This shows individual match results and the exact MMR gained or lost by each
-                  player in that match.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  This is useful because it makes the rating changes transparent instead of
-                  showing only the final leaderboard.
+                  Every match result with exact MMR deltas for all four players. This makes
+                  the rating changes fully transparent rather than just showing a final number.
                 </p>
               </div>
             </div>
 
             <div className="how-section">
-              <div className="how-title">Important Limitations</div>
-              <div className="how-card">
-                <h4>What this does not mean</h4>
-                <p>
-                  This is still a simulation, so it is not claiming to measure real-life padel
-                  skill perfectly.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  It is a model that tries to estimate skill from repeated match outcomes.
-                  That means the rating improves as more information is collected, but it is
-                  never based on one match alone.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  In practical terms, ratings become more trustworthy when:
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  • players have many matches<br />
-                  • opponents vary enough<br />
-                  • match results are not based on too little data
-                </p>
-              </div>
-
-              <div className="how-card">
-                <h4>Why more games make it fairer</h4>
-                <p>
-                  With only a few games, luck can have a large effect. A player might face
-                  unusually strong teams, unusually weak teams, or simply have a small sample
-                  of results.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  With many games, those random effects matter less. The system gets a clearer
-                  picture of performance over time, and the rating becomes more stable and
-                  more believable.
-                </p>
-              </div>
-            </div>
-
-            <div className="how-section">
-              <div className="how-title">About This Simulation</div>
+              <div className="how-title">Current Simulation Settings</div>
               <div className="how-card">
                 <p>
-                  This version uses <code>{NUM_PLAYERS}</code> players and aims for about{" "}
-                  <code>{GAMES_PER_PLAYER_TARGET}</code> games per player on average.
+                  <code>NUM_PLAYERS = {NUM_PLAYERS}</code> — total players in the pool<br />
+                  <code>GAMES_PER_PLAYER_TARGET = {GAMES_PER_PLAYER_TARGET}</code> — avg games per player<br />
+                  <code>MMR_START = {MMR_START}</code> — everyone starts here<br />
+                  <code>K_MAX = {K_MAX}</code> — K at game 0<br />
+                  <code>K_MIN = {K_MIN}</code> — K floor for veterans<br />
+                  <code>K_DECAY_RATE = {K_DECAY_RATE}</code> — games to decay by ~63%<br />
+                  <code>UPSET_BONUS_SCALE = {UPSET_BONUS_SCALE}</code> — upset reward multiplier<br />
+                  <code>TEAMMATE_DIFF_FACTOR = {TEAMMATE_DIFF_FACTOR}</code> — teammate adjustment weight
                 </p>
                 <p style={{ marginTop: 12 }}>
-                  Every player starts at <code>{MMR_START}</code>, but they do not all have
-                  the same hidden True Skill. The system has to discover that through results.
-                </p>
-                <p style={{ marginTop: 12 }}>
-                  Changing the seed creates a different simulated player pool and different
-                  match outcomes, while keeping the same rating rules.
+                  Changing the seed generates a different player pool and match sequence
+                  while keeping all the same rules.
                 </p>
               </div>
             </div>
