@@ -236,7 +236,12 @@ function runSimulation(seed = 42) {
     [skills[i], skills[j]] = [skills[j], skills[i]];
   }
 
-  const players = skills.map((s, i) => createPlayer(i, NAMES[i], s, MMR_START));
+  const players = skills.map((s, i) => {
+    const trueMmr = ((s - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 2000;
+    const noise = (rng() - 0.5) * 300; // +-150 MMR noise around true level
+    const startMmr = Math.max(0, Math.round(trueMmr + noise));
+    return createPlayer(i, NAMES[i], s, startMmr);
+  });
   const matches = [];
   let gc = 0;
   let cp = 0;
