@@ -2,20 +2,28 @@ import { useState, useEffect, useRef, useMemo } from "react";
 
 // ─── MMR Engine (V4 Core Logic) ───────────────────────────────────────
 const NUM_PLAYERS = 40;
-const GAMES_PER_PLAYER_TARGET = 100;
-const CALIBRATION_GAMES = 8;
-const MMR_START = 1000;
-const BASE_K = 32;
-const K_CALIBRATION = 64;
-const K_VETERAN = 24;
-const K_VETERAN_THRESHOLD = 30;
+const GAMES_PER_PLAYER_TARGET = 300;
+const CALIBRATION_GAMES = 20;
+const MMR_START = 300;
+const BASE_K = 40;
+const K_CALIBRATION = 96;
+const K_VETERAN = 48;
+const K_VETERAN_THRESHOLD = 100;
 const UPSET_BONUS_SCALE = 0.6;
 const MAX_GAIN_MULTIPLIER = 2.0;
 const MIN_GAIN_MULTIPLIER = 0.4;
-const MARGIN_MULTIPLIERS = { stomp: 1.25, clear: 1.1, normal: 1.0, close: 0.85 };
+const MARGIN_MULTIPLIERS = { stomp: 1.45, clear: 1.15, normal: 1.0, close: 0.75 };
 const TEAMMATE_DIFF_FACTOR = 0.15;
+const MIN_MMR_CHANGE = 5;
 const TRUE_SKILL_MIN = 10.0;
 const TRUE_SKILL_MAX = 40.0;
+const PERF_WINDOW = 20;
+const PERF_THRESHOLDS = [
+  [0.70, 1.8],
+  [0.65, 1.5],
+  [0.60, 1.25],
+  [0.55, 1.1],
+];
 
 const RANK_TIERS = [
   [0, "Bronze III", "#8B6914", "I"],
@@ -85,9 +93,45 @@ function createPlayer(id, name, trueSkill) {
     streak: 0,
     peakMmr: MMR_START,
     recentOpponents: [],
+    recentResults: [],
     history: [],
     get isProvisional() {
       return this.gamesPlayed < CALIBRATION_GAMES;
+    },
+    get performanceMultiplier() {
+      if (this.recentResults.length < 8) return 1.0;
+      const recent = this.recentResults.slice(-PERF_WINDOW);
+      const wr = recent.reduce((s, r) => s + r, 0) / recent.length;
+      
+      // Upward accelerators
+      for (const [threshold, mult] of PERF_THRESHOLDS) {
+        if (wr >= threshold) return mult;
+      }
+      
+      // Downward accelerators (symmetric for losers)
+      if (wr <= 0.30) return 1.8;  // chronic loser, gains are tiny anyway
+      if (wr <= 0.35) return 1.5;
+      if (wr <= 0.40) return 1.25;
+      
+      return 1.0;
+    },
+    get performanceLossShield() {
+      if (this.recentResults.length < 8) return 1.0;
+      const recent = this.recentResults.slice(-PERF_WINDOW);
+      const wr = recent.reduce((s, r) => s + r, 0) / recent.length;
+      
+      // Only shield if average delta is also positive (confirming underrated, not lucky)
+      const recentHistory = this.history.slice(-PERF_WINDOW);
+      const avgDelta = recentHistory.length > 0
+        ? recentHistory.reduce((s, h) => s + h.delta, 0) / recentHistory.length
+        : 0;
+      
+      if (avgDelta <= 0) return 1.0; // not climbing → no shield
+      
+      if (wr >= 0.70) return 0.6;
+      if (wr >= 0.65) return 0.75;
+      if (wr >= 0.60) return 0.85;
+      return 1.0;
     },
     get kFactor() {
       if (this.gamesPlayed < CALIBRATION_GAMES) {
@@ -145,9 +189,21 @@ function calcMmrChanges(teamA, teamB, winner, margin) {
   const lMmr = lt.reduce((s, p) => s + p.mmr, 0) / lt.length;
   const expW = expectedScore(wMmr, lMmr);
   const mm = MARGIN_MULTIPLIERS[margin] || 1.0;
+
+  // diff > 0 = upset (winner was lower rated)
   const diff = lMmr - wMmr;
-  const am = Math.max(MIN_GAIN_MULTIPLIER, Math.min(MAX_GAIN_MULTIPLIER, 1.0 + (diff / 100) * UPSET_BONUS_SCALE));
-  const lam = Math.max(MIN_GAIN_MULTIPLIER, Math.min(MAX_GAIN_MULTIPLIER, 1.0 + (-diff / 100) * UPSET_BONUS_SCALE));
+
+  // Winners: rewarded MORE for upsets (diff > 0), LESS for expected wins (diff < 0)
+  const am = Math.max(MIN_GAIN_MULTIPLIER, Math.min(MAX_GAIN_MULTIPLIER,
+    1.0 + (diff / 100) * UPSET_BONUS_SCALE
+  ));
+
+  // Losers: penalized MORE when they LOST to a weaker team (diff > 0 = they were favored)
+  // Invert diff so the loser's multiplier mirrors the upset logic independently
+  const lam = Math.max(MIN_GAIN_MULTIPLIER, Math.min(MAX_GAIN_MULTIPLIER,
+    1.0 + (-diff / 100) * UPSET_BONUS_SCALE  // ← negative diff: favored team loses more
+  ));
+
   const changes = {};
 
   for (const p of wt) {
@@ -159,18 +215,24 @@ function calcMmrChanges(teamA, teamB, winner, margin) {
       gain *= ta;
     }
     if (p.streak > 0) gain += Math.min(p.streak * 0.5, 3.0);
-    changes[p.id] = Math.round(gain * 10) / 10;
+    // Performance accelerator: sustained high WR boosts gains
+    gain *= p.performanceMultiplier;
+    // Floor only during calibration to help initial placement
+    const floor = p.gamesPlayed < CALIBRATION_GAMES ? MIN_MMR_CHANGE : 0;
+    changes[p.id] = Math.max(floor, Math.round(gain * 10) / 10);
   }
 
   for (const p of lt) {
     const k = p.kFactor;
-    let loss = k * expW * lam * mm;
+    let loss = k * (1.0 - expW) * lam * mm;
     const tm = lt.find((t) => t.id !== p.id);
     if (tm) {
       const ta = Math.max(0.8, Math.min(1.2, 1.0 + ((p.mmr - tm.mmr) / 100) * TEAMMATE_DIFF_FACTOR));
       loss *= ta;
     }
-    if (p.streak < -3) loss *= 0.85;
+    // Performance shield: high WR players lose less on occasional losses
+    loss *= p.performanceLossShield;
+    loss *= p.performanceMultiplier;
     changes[p.id] = Math.round(-loss * 10) / 10;
   }
 
@@ -178,7 +240,7 @@ function calcMmrChanges(teamA, teamB, winner, margin) {
 }
 
 function createMatch(players, rng) {
-  const eligible = players.filter((p) => p.gamesPlayed < GAMES_PER_PLAYER_TARGET + 3);
+  const eligible = players.filter((p) => p.gamesPlayed < GAMES_PER_PLAYER_TARGET);
   const pool = eligible.length >= 4 ? eligible : [...players];
   const weights = pool.map((p) => Math.max(1, GAMES_PER_PLAYER_TARGET - p.gamesPlayed));
 
@@ -199,7 +261,7 @@ function createMatch(players, rng) {
 
   const cw = cands.map(
     (p) =>
-      Math.max(0.1, 1 - Math.abs(p.mmr - anchor.mmr) / 500) *
+      Math.max(0.1, 1 - Math.abs(p.mmr - anchor.mmr) / 800) *
       Math.max(1, GAMES_PER_PLAYER_TARGET - p.gamesPlayed)
   );
 
@@ -256,9 +318,9 @@ function runSimulation(seed = 42) {
   let gc = 0;
   let cp = 0;
 
-  while (gc < 500) {
-    const avg = players.reduce((s, p) => s + p.gamesPlayed, 0) / players.length;
-    if (avg >= GAMES_PER_PLAYER_TARGET) break;
+  while (gc < 4000) {
+    const minGames = Math.min(...players.map((p) => p.gamesPlayed));
+    if (minGames >= GAMES_PER_PLAYER_TARGET) break;
 
     const [teamA, teamB] = createMatch(players, rng);
     if (teamA.length < 2 || teamB.length < 2) continue;
@@ -296,18 +358,450 @@ function runSimulation(seed = 42) {
       p.wins++;
       p.gamesPlayed++;
       p.streak = p.streak >= 0 ? p.streak + 1 : 1;
+      p.recentResults.push(1);
+      if (p.recentResults.length > PERF_WINDOW) p.recentResults.shift();
     }
 
     for (const p of actual === 0 ? teamB : teamA) {
       p.losses++;
       p.gamesPlayed++;
       p.streak = p.streak <= 0 ? p.streak - 1 : -1;
+      p.recentResults.push(0);
+      if (p.recentResults.length > PERF_WINDOW) p.recentResults.shift();
     }
 
     matches.push(matchRecord);
   }
 
   return { players, matches, totalMatches: gc, correctPredictions: cp };
+}
+
+// ─── Diagnostics Stats ───────────────────────────────────────────────
+function computeDiagnostics(players) {
+  const n = players.length;
+  const xs = players.map((p) => p.trueSkill);
+  const ys = players.map((p) => p.mmr);
+  const targets = players.map((p) => p.trueMmr);
+
+  // Linear regression: MMR vs trueSkill
+  const xMean = xs.reduce((a, b) => a + b, 0) / n;
+  const yMean = ys.reduce((a, b) => a + b, 0) / n;
+  let ssXY = 0, ssXX = 0, ssTot = 0, ssRes = 0;
+  for (let i = 0; i < n; i++) {
+    ssXY += (xs[i] - xMean) * (ys[i] - yMean);
+    ssXX += (xs[i] - xMean) * (xs[i] - xMean);
+    ssTot += (ys[i] - yMean) * (ys[i] - yMean);
+  }
+  const slope = ssXX > 0 ? ssXY / ssXX : 0;
+  const intercept = yMean - slope * xMean;
+  for (let i = 0; i < n; i++) {
+    const predicted = slope * xs[i] + intercept;
+    ssRes += (ys[i] - predicted) * (ys[i] - predicted);
+  }
+  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+
+  // MAE: final MMR vs trueMmr target
+  const mae = targets.reduce((s, t, i) => s + Math.abs(ys[i] - t), 0) / n;
+
+  // Spearman rank correlation
+  const rankBy = (arr) => {
+    const sorted = arr.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+    const ranks = new Array(n);
+    for (let i = 0; i < n; i++) ranks[sorted[i][1]] = i + 1;
+    return ranks;
+  };
+  const rTrue = rankBy(xs);
+  const rMmr = rankBy(ys);
+  let dSq = 0;
+  for (let i = 0; i < n; i++) dSq += (rTrue[i] - rMmr[i]) ** 2;
+  const spearman = 1 - (6 * dSq) / (n * (n * n - 1));
+
+  // Convergence: % of players within 200 MMR of their trueMmr
+  const converged = players.filter((p) => Math.abs(p.mmr - p.trueMmr) < 200).length;
+  const convergePct = ((converged / n) * 100).toFixed(0);
+
+  // Biggest over/under performers
+  const deviations = players.map((p) => ({
+    name: p.name,
+    mmr: p.mmr,
+    trueMmr: p.trueMmr,
+    diff: p.mmr - p.trueMmr,
+  }));
+  deviations.sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+  const outliers = deviations.slice(0, 5);
+
+  return { slope, intercept, r2, mae, spearman, convergePct, converged, n, outliers, xs, ys, targets };
+}
+
+// ─── Scatter Plot Canvas ──────────────────────────────────────────────
+function ScatterPlot({ players, diagnostics }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !diagnostics) return;
+
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+
+    const W = rect.width;
+    const H = rect.height;
+    const pad = { top: 24, right: 24, bottom: 40, left: 56 };
+
+    const { xs, ys, slope, intercept } = diagnostics;
+    const xMin = Math.min(...xs) - 2;
+    const xMax = Math.max(...xs) + 2;
+    const yMin = Math.min(...ys) - 50;
+    const yMax = Math.max(...ys) + 50;
+
+    const toX = (v) => pad.left + ((v - xMin) / (xMax - xMin)) * (W - pad.left - pad.right);
+    const toY = (v) => pad.top + (1 - (v - yMin) / (yMax - yMin)) * (H - pad.top - pad.bottom);
+
+    ctx.clearRect(0, 0, W, H);
+
+    // Grid
+    ctx.strokeStyle = "rgba(42,46,56,0.6)";
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i <= 4; i++) {
+      const v = yMin + ((yMax - yMin) / 4) * i;
+      const y = toY(v);
+      ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+      ctx.fillStyle = "#5a5f78";
+      ctx.font = "10px 'JetBrains Mono', monospace";
+      ctx.textAlign = "right";
+      ctx.fillText(Math.round(v).toString(), pad.left - 8, y + 3);
+    }
+    for (let i = 0; i <= 4; i++) {
+      const v = xMin + ((xMax - xMin) / 4) * i;
+      const x = toX(v);
+      ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, H - pad.bottom); ctx.stroke();
+      ctx.fillStyle = "#5a5f78";
+      ctx.font = "10px 'JetBrains Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(v.toFixed(0), x, H - pad.bottom + 16);
+    }
+
+    // Perfect line (trueMmr mapping)
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "rgba(34,197,94,0.3)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    const perfY1 = 200 + ((xMin - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 1800;
+    const perfY2 = 200 + ((xMax - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 1800;
+    ctx.moveTo(toX(xMin), toY(perfY1));
+    ctx.lineTo(toX(xMax), toY(perfY2));
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Regression line
+    ctx.strokeStyle = "rgba(245,158,11,0.7)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(toX(xMin), toY(slope * xMin + intercept));
+    ctx.lineTo(toX(xMax), toY(slope * xMax + intercept));
+    ctx.stroke();
+
+    // Data points
+    for (let i = 0; i < xs.length; i++) {
+      const x = toX(xs[i]);
+      const y = toY(ys[i]);
+      const target = players[i].trueMmr;
+      const err = Math.abs(ys[i] - target);
+      const color = err < 100 ? "#22c55e" : err < 200 ? "#f59e0b" : "#ef4444";
+
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.8;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    // Labels
+    ctx.fillStyle = "#5a5f78";
+    ctx.font = "10px 'JetBrains Mono', monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("TRUE SKILL", W / 2, H - 4);
+    ctx.save();
+    ctx.translate(12, H / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText("FINAL MMR", 0, 0);
+    ctx.restore();
+  }, [players, diagnostics]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="chart-canvas"
+      style={{ width: "100%", height: 320 }}
+    />
+  );
+}
+
+// ─── Glicko-2 / Bayesian Engine ───────────────────────────────────────
+const G2_MU_START = 1000;
+const G2_SIGMA_START = 350;
+const G2_SIGMA_FLOOR = 60;
+const G2_DISPLAY_K = 1.8;
+const G2_MARGIN_EVIDENCE = { stomp: 0.9, clear: 0.7, normal: 0.5, close: 0.25 };
+const G2_INDIVIDUAL_WEIGHT = 0.7;
+
+function g2CreatePlayer(id, name, trueSkill) {
+  return {
+    id,
+    name,
+    trueSkill,
+    mu: G2_MU_START,
+    sigma: G2_SIGMA_START,
+    gamesPlayed: 0,
+    wins: 0,
+    losses: 0,
+    peakMu: G2_MU_START,
+    history: [],
+    recentOpponents: [],
+    get displayRating() {
+      return Math.max(0, this.mu - G2_DISPLAY_K * this.sigma);
+    },
+    get mmr() { return this.mu; },
+    get trueMmr() {
+      return 200 + ((this.trueSkill - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 1800;
+    },
+    get winRate() {
+      return this.gamesPlayed > 0 ? ((this.wins / this.gamesPlayed) * 100).toFixed(0) : "0";
+    },
+    get rank() { return getRank(this.mu); },
+  };
+}
+
+function g2Expected(playerMu, playerSigma, teammateMu, oppAvgMu, oppAvgSigma) {
+  const effective = playerMu * G2_INDIVIDUAL_WEIGHT + teammateMu * (1 - G2_INDIVIDUAL_WEIGHT);
+  const g = 1 / Math.sqrt(1 + 3 * (playerSigma * playerSigma + oppAvgSigma * oppAvgSigma) / (Math.PI * Math.PI * 400 * 400 / (Math.log(10) * Math.log(10))));
+  return 1 / (1 + Math.pow(10, -g * (effective - oppAvgMu) / 400));
+}
+
+function g2CalcChanges(teamA, teamB, winner, margin) {
+  const wt = winner === 0 ? teamA : teamB;
+  const lt = winner === 0 ? teamB : teamA;
+  const evidence = G2_MARGIN_EVIDENCE[margin] || 0.5;
+  const changes = {};
+
+  const wAvgMu = wt.reduce((s, p) => s + p.mu, 0) / wt.length;
+  const lAvgMu = lt.reduce((s, p) => s + p.mu, 0) / lt.length;
+  const wAvgSigma = wt.reduce((s, p) => s + p.sigma, 0) / wt.length;
+  const lAvgSigma = lt.reduce((s, p) => s + p.sigma, 0) / lt.length;
+
+  for (const p of wt) {
+    const tm = wt.find((t) => t.id !== p.id);
+    const tmMu = tm ? tm.mu : p.mu;
+    const exp = g2Expected(p.mu, p.sigma, tmMu, lAvgMu, lAvgSigma);
+    const surprise = 1 - exp;
+    const sigmaFactor = p.sigma / G2_SIGMA_START;
+    const muDelta = p.sigma * sigmaFactor * surprise * (1 + evidence * 0.5) * 2.5;
+    const sigmaReduce = p.sigma * evidence * 0.04;
+    changes[p.id] = {
+      muDelta: Math.round(muDelta * 10) / 10,
+      sigmaNew: Math.max(G2_SIGMA_FLOOR, p.sigma - sigmaReduce),
+    };
+  }
+
+  for (const p of lt) {
+    const tm = lt.find((t) => t.id !== p.id);
+    const tmMu = tm ? tm.mu : p.mu;
+    const exp = g2Expected(p.mu, p.sigma, tmMu, wAvgMu, wAvgSigma);
+    const sigmaFactor = p.sigma / G2_SIGMA_START;
+    const muDelta = p.sigma * sigmaFactor * exp * (1 + evidence * 0.3) * 2.5;
+    const sigmaReduce = p.sigma * evidence * 0.03;
+    changes[p.id] = {
+      muDelta: Math.round(-muDelta * 10) / 10,
+      sigmaNew: Math.max(G2_SIGMA_FLOOR, p.sigma - sigmaReduce),
+    };
+  }
+
+  return changes;
+}
+
+function g2CreateMatch(players, rng) {
+  const eligible = players.filter((p) => p.gamesPlayed < GAMES_PER_PLAYER_TARGET);
+  const pool = eligible.length >= 4 ? eligible : [...players];
+  const weights = pool.map((p) => Math.max(1, GAMES_PER_PLAYER_TARGET - p.gamesPlayed));
+
+  function weightedPick(candidates, cWeights) {
+    const total = cWeights.reduce((a, b) => a + b, 0);
+    let r = rng() * total;
+    for (let i = 0; i < candidates.length; i++) {
+      r -= cWeights[i];
+      if (r <= 0) return i;
+    }
+    return candidates.length - 1;
+  }
+
+  const anchorIdx = weightedPick(pool, weights);
+  const anchor = pool[anchorIdx];
+  let cands = pool.filter((p) => p.id !== anchor.id && !anchor.recentOpponents.slice(-4).includes(p.id));
+  if (cands.length < 3) cands = pool.filter((p) => p.id !== anchor.id);
+
+  const cw = cands.map((p) => {
+    const proximity = Math.max(0.1, 1 - Math.abs(p.mu - anchor.mu) / 800);
+    const needGames = Math.max(1, GAMES_PER_PLAYER_TARGET - p.gamesPlayed);
+    // High-sigma players get probed with more diverse opponents
+    const probeBonus = p.sigma > 200 ? 0.3 * (Math.abs(p.mu - anchor.mu) / 800) : 0;
+    return (proximity + probeBonus) * needGames;
+  });
+
+  const selected = [anchor];
+  const remCands = [...cands];
+  const remW = [...cw];
+
+  for (let i = 0; i < 3 && remCands.length > 0; i++) {
+    const idx = weightedPick(remCands, remW);
+    selected.push(remCands[idx]);
+    remCands.splice(idx, 1);
+    remW.splice(idx, 1);
+  }
+
+  if (selected.length < 4) return [[], []];
+
+  selected.sort((a, b) => b.mu - a.mu);
+  const teamA = [selected[0], selected[3]];
+  const teamB = [selected[1], selected[2]];
+
+  for (const p of teamA) {
+    for (const o of teamB) {
+      p.recentOpponents.push(o.id);
+      p.recentOpponents = p.recentOpponents.slice(-8);
+    }
+  }
+  for (const p of teamB) {
+    for (const o of teamA) {
+      p.recentOpponents.push(o.id);
+      p.recentOpponents = p.recentOpponents.slice(-8);
+    }
+  }
+
+  return [teamA, teamB];
+}
+
+function runGlickoSimulation(seed = 42) {
+  const rng = seededRandom(seed);
+  const skills = [];
+
+  for (let i = 0; i < NUM_PLAYERS; i++) {
+    const r = rng();
+    const tier = r < 0.25 ? "b" : r < 0.75 ? "i" : "a";
+    const means = { b: 15, i: 25, a: 35 };
+    const stds = { b: 2.5, i: 3, a: 2.5 };
+    let s = means[tier] + gaussianRandom(rng) * stds[tier];
+    s = Math.max(TRUE_SKILL_MIN, Math.min(TRUE_SKILL_MAX, s));
+    skills.push(s);
+  }
+
+  const players = skills.map((s, i) => g2CreatePlayer(i, NAMES[i], s));
+  const matches = [];
+  let gc = 0;
+  let cp = 0;
+
+  while (gc < 4000) {
+    const minGames = Math.min(...players.map((p) => p.gamesPlayed));
+    if (minGames >= GAMES_PER_PLAYER_TARGET) break;
+
+    const [teamA, teamB] = g2CreateMatch(players, rng);
+    if (teamA.length < 2 || teamB.length < 2) continue;
+
+    gc++;
+    const tamAvg = (teamA[0].mu + teamA[1].mu) / 2;
+    const tbmAvg = (teamB[0].mu + teamB[1].mu) / 2;
+    const pred = tamAvg >= tbmAvg ? 0 : 1;
+    const actual = simulateMatch(teamA, teamB, rng);
+    if (pred === actual) cp++;
+
+    const td = teamA.reduce((s, p) => s + p.trueSkill, 0) - teamB.reduce((s, p) => s + p.trueSkill, 0);
+    const wd = actual === 0 ? td : -td;
+    const margin = getMargin(wd);
+    const changes = g2CalcChanges(teamA, teamB, actual, margin);
+
+    const matchRecord = {
+      id: gc,
+      teamA: teamA.map((p) => ({ id: p.id, name: p.name, mmrBefore: p.mu, change: changes[p.id].muDelta })),
+      teamB: teamB.map((p) => ({ id: p.id, name: p.name, mmrBefore: p.mu, change: changes[p.id].muDelta })),
+      winner: actual,
+      margin,
+    };
+
+    for (const p of [...teamA, ...teamB]) {
+      const c = changes[p.id];
+      p.mu += c.muDelta;
+      p.mu = Math.max(0, p.mu);
+      p.sigma = c.sigmaNew;
+      p.history.push({ match: gc, mmr: p.mu, delta: c.muDelta });
+      if (p.mu > p.peakMu) p.peakMu = p.mu;
+    }
+
+    for (const p of actual === 0 ? teamA : teamB) {
+      p.wins++;
+      p.gamesPlayed++;
+    }
+    for (const p of actual === 0 ? teamB : teamA) {
+      p.losses++;
+      p.gamesPlayed++;
+    }
+
+    matches.push(matchRecord);
+  }
+
+  return { players, matches, totalMatches: gc, correctPredictions: cp };
+}
+
+function computeG2Diagnostics(players) {
+  const n = players.length;
+  const xs = players.map((p) => p.trueSkill);
+  const ys = players.map((p) => p.mu);
+  const targets = players.map((p) => p.trueMmr);
+
+  const xMean = xs.reduce((a, b) => a + b, 0) / n;
+  const yMean = ys.reduce((a, b) => a + b, 0) / n;
+  let ssXY = 0, ssXX = 0, ssTot = 0, ssRes = 0;
+  for (let i = 0; i < n; i++) {
+    ssXY += (xs[i] - xMean) * (ys[i] - yMean);
+    ssXX += (xs[i] - xMean) * (xs[i] - xMean);
+    ssTot += (ys[i] - yMean) * (ys[i] - yMean);
+  }
+  const slope = ssXX > 0 ? ssXY / ssXX : 0;
+  const intercept = yMean - slope * xMean;
+  for (let i = 0; i < n; i++) {
+    const predicted = slope * xs[i] + intercept;
+    ssRes += (ys[i] - predicted) * (ys[i] - predicted);
+  }
+  const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+  const mae = targets.reduce((s, t, i) => s + Math.abs(ys[i] - t), 0) / n;
+
+  const rankBy = (arr) => {
+    const sorted = arr.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+    const ranks = new Array(n);
+    for (let i = 0; i < n; i++) ranks[sorted[i][1]] = i + 1;
+    return ranks;
+  };
+  const rTrue = rankBy(xs);
+  const rMmr = rankBy(ys);
+  let dSq = 0;
+  for (let i = 0; i < n; i++) dSq += (rTrue[i] - rMmr[i]) ** 2;
+  const spearman = 1 - (6 * dSq) / (n * (n * n - 1));
+
+  const converged = players.filter((p) => Math.abs(p.mu - p.trueMmr) < 100).length;
+  const convergePct = ((converged / n) * 100).toFixed(0);
+  const avgSigma = Math.round(players.reduce((s, p) => s + p.sigma, 0) / n);
+
+  return { slope, intercept, r2, mae, spearman, convergePct, converged, n, avgSigma, xs, ys, targets };
 }
 
 // ─── Rank Icon SVG ────────────────────────────────────────────────────
@@ -511,9 +1005,9 @@ body {
 
 .hero-stats {
   display: grid;
-  grid-template-columns: repeat(4, minmax(80px, 1fr));
+  grid-template-columns: repeat(5, minmax(80px, 1fr));
   gap: 20px;
-  max-width: 720px;
+  max-width: 820px;
   margin: 0 auto;
 }
 
@@ -1319,13 +1813,20 @@ export default function PadelMMR() {
   const [tab, setTab] = useState("leaderboard");
   const [selectedPlayer, setSelectedPlayer] = useState(null);
   const [seed, setSeed] = useState(42);
+  const [lbMode, setLbMode] = useState("v4"); // "v4" or "bayesian"
 
   const sim = useMemo(() => runSimulation(seed), [seed]);
+  const g2sim = useMemo(() => runGlickoSimulation(seed), [seed]);
   const { players, matches, totalMatches, correctPredictions } = sim;
   const sorted = useMemo(() => [...players].sort((a, b) => b.mmr - a.mmr), [players]);
+  const g2sorted = useMemo(() => [...g2sim.players].sort((a, b) => b.mu - a.mu), [g2sim.players]);
 
   const predAcc = totalMatches > 0 ? ((correctPredictions / totalMatches) * 100).toFixed(1) : "0";
   const mmrSpread = Math.round(Math.max(...players.map((p) => p.mmr)) - Math.min(...players.map((p) => p.mmr)));
+  const convergence = useMemo(() => {
+    const conv = players.filter((p) => Math.abs(p.mmr - p.trueMmr) < 100).length;
+    return ((conv / players.length) * 100).toFixed(0);
+  }, [players]);
 
   const viewPlayer = (p) => {
     setSelectedPlayer(p);
@@ -1361,6 +1862,10 @@ export default function PadelMMR() {
             <div className="hero-stat-value">{mmrSpread}</div>
             <div className="hero-stat-label">MMR Spread</div>
           </div>
+          <div className="hero-stat">
+            <div className="hero-stat-value" style={{ color: parseInt(convergence, 10) >= 70 ? 'var(--green)' : parseInt(convergence, 10) >= 40 ? 'var(--accent)' : 'var(--red)' }}>{convergence}%</div>
+            <div className="hero-stat-label">Convergence</div>
+          </div>
         </div>
       </div>
 
@@ -1369,6 +1874,8 @@ export default function PadelMMR() {
   "how it works",
   "leaderboard",
   "matches",
+  "diagnostics",
+  "compare",
 ].map((t) => (
   <button
     key={t}
@@ -1438,77 +1945,188 @@ export default function PadelMMR() {
         </div>
 
         {tab === "leaderboard" && (
-          <div className="lb-wrap">
-            <div className="lb-table">
-              <div className="lb-header">
-                <div>#</div>
-                <div>Player</div>
-                <div>MMR</div>
-                <div>Rank</div>
-                <div>Record</div>
-                <div>WR%</div>
-                <div>Streak</div>
-                <div>Trend</div>
-              </div>
-
-              {sorted.map((p, i) => {
-                const rank = i + 1;
-                const [, rankName, rankColor] = p.rank;
-
-                return (
-                  <div
-                    key={p.id}
-                    className={`lb-row ${selectedPlayer?.id === p.id ? "selected" : ""}`}
-                    onClick={() => viewPlayer(p)}
-                  >
-                    <div className={`lb-rank ${rank <= 3 ? "top-3" : ""}`}>{rank}</div>
-                    <div className="lb-player">
-                      <RankBadge mmr={p.mmr} size={26} />
-                      <div>
-                        <div className="lb-name">{p.name}</div>
-                        <span className={`lb-tag ${p.isProvisional ? "prov" : "cal"}`}>
-                          {p.isProvisional ? "PROV" : "CAL"}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="lb-mmr" style={{ color: rankColor }}>
-                      {Math.round(p.mmr)}
-                    </div>
-                    <div className="lb-rank-name" style={{ color: rankColor }}>
-                      {rankName}
-                    </div>
-                    <div className="lb-record">
-                      {p.wins}-{p.losses}
-                    </div>
-                    <div
-                      className="lb-wr"
-                      style={{
-                        color: parseInt(p.winRate, 10) >= 50 ? "var(--green)" : "var(--red)",
-                      }}
-                    >
-                      {p.winRate}%
-                    </div>
-                    <div
-                      className="lb-streak"
-                      style={{
-                        color:
-                          p.streak > 0
-                            ? "var(--green)"
-                            : p.streak < 0
-                            ? "var(--red)"
-                            : "var(--text-muted)",
-                      }}
-                    >
-                      {p.streak > 0 ? `W${p.streak}` : p.streak < 0 ? `L${Math.abs(p.streak)}` : "—"}
-                    </div>
-                    <div>
-                      <Sparkline data={p.history} />
-                    </div>
-                  </div>
-                );
-              })}
+          <>
+            <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+              {["v4", "bayesian"].map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setLbMode(m)}
+                  style={{
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: 11,
+                    padding: "6px 16px",
+                    borderRadius: 4,
+                    border: `1px solid ${lbMode === m ? (m === "v4" ? "var(--accent)" : "var(--blue)") : "var(--border)"}`,
+                    background: lbMode === m ? (m === "v4" ? "rgba(245,158,11,0.1)" : "rgba(59,130,246,0.1)") : "var(--bg-card)",
+                    color: lbMode === m ? (m === "v4" ? "var(--accent)" : "var(--blue)") : "var(--text-muted)",
+                    cursor: "pointer",
+                    fontWeight: lbMode === m ? 700 : 400,
+                  }}
+                >
+                  {m === "v4" ? "V4 Elo" : "Bayesian μ/σ"}
+                </button>
+              ))}
             </div>
-          </div>
+
+            {lbMode === "v4" && (
+              <div className="lb-wrap">
+                <div className="lb-table">
+                  <div className="lb-header">
+                    <div>#</div>
+                    <div>Player</div>
+                    <div>MMR</div>
+                    <div>Rank</div>
+                    <div>Record</div>
+                    <div>WR%</div>
+                    <div>Streak</div>
+                    <div>Trend</div>
+                  </div>
+
+                  {sorted.map((p, i) => {
+                    const rank = i + 1;
+                    const [, rankName, rankColor] = p.rank;
+
+                    return (
+                      <div
+                        key={p.id}
+                        className={`lb-row ${selectedPlayer?.id === p.id ? "selected" : ""}`}
+                        onClick={() => viewPlayer(p)}
+                      >
+                        <div className={`lb-rank ${rank <= 3 ? "top-3" : ""}`}>{rank}</div>
+                        <div className="lb-player">
+                          <RankBadge mmr={p.mmr} size={26} />
+                          <div>
+                            <div className="lb-name">{p.name}</div>
+                            <span className={`lb-tag ${p.isProvisional ? "prov" : "cal"}`}>
+                              {p.isProvisional ? "PROV" : "CAL"}
+                            </span>
+                            <span style={{
+                              fontFamily: "'JetBrains Mono', monospace",
+                              fontSize: 9,
+                              color: "var(--text-muted)",
+                              opacity: 0.5,
+                              marginLeft: 6,
+                            }}>
+                              True: {Math.round(p.trueMmr)}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="lb-mmr" style={{ color: rankColor }}>
+                          {Math.round(p.mmr)}
+                        </div>
+                        <div className="lb-rank-name" style={{ color: rankColor }}>
+                          {rankName}
+                        </div>
+                        <div className="lb-record">
+                          {p.wins}-{p.losses}
+                        </div>
+                        <div
+                          className="lb-wr"
+                          style={{
+                            color: parseInt(p.winRate, 10) >= 50 ? "var(--green)" : "var(--red)",
+                          }}
+                        >
+                          {p.winRate}%
+                        </div>
+                        <div
+                          className="lb-streak"
+                          style={{
+                            color:
+                              p.streak > 0
+                                ? "var(--green)"
+                                : p.streak < 0
+                                ? "var(--red)"
+                                : "var(--text-muted)",
+                          }}
+                        >
+                          {p.streak > 0 ? `W${p.streak}` : p.streak < 0 ? `L${Math.abs(p.streak)}` : "—"}
+                        </div>
+                        <div>
+                          <Sparkline data={p.history} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {lbMode === "bayesian" && (
+              <div className="lb-wrap">
+                <div className="lb-table">
+                  <div className="lb-header" style={{ gridTemplateColumns: "44px 1fr 80px 80px 80px 70px 60px 120px" }}>
+                    <div>#</div>
+                    <div>Player</div>
+                    <div>μ (Skill)</div>
+                    <div>Display</div>
+                    <div>σ</div>
+                    <div>Record</div>
+                    <div>WR%</div>
+                    <div>Trend</div>
+                  </div>
+
+                  {g2sorted.map((p, i) => {
+                    const [, rankName, rankColor] = getRank(p.mu);
+
+                    return (
+                      <div
+                        key={p.id}
+                        className="lb-row"
+                        style={{ gridTemplateColumns: "44px 1fr 80px 80px 80px 70px 60px 120px", cursor: "default" }}
+                      >
+                        <div className={`lb-rank ${i < 3 ? "top-3" : ""}`}>{i + 1}</div>
+                        <div className="lb-player">
+                          <RankBadge mmr={p.mu} size={26} />
+                          <div>
+                            <div className="lb-name">{p.name}</div>
+                            <span style={{
+                              fontFamily: "'JetBrains Mono', monospace",
+                              fontSize: 9,
+                              color: "var(--text-muted)",
+                            }}>
+                              True: {Math.round(p.trueMmr)}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="lb-mmr" style={{ color: rankColor }}>
+                          {Math.round(p.mu)}
+                        </div>
+                        <div style={{
+                          fontFamily: "'JetBrains Mono', monospace",
+                          fontSize: 14,
+                          fontWeight: 600,
+                          color: "var(--blue)",
+                        }}>
+                          {Math.round(p.displayRating)}
+                        </div>
+                        <div style={{
+                          fontFamily: "'JetBrains Mono', monospace",
+                          fontSize: 12,
+                          color: p.sigma > 200 ? "var(--red)" : p.sigma > 100 ? "var(--accent)" : "var(--green)",
+                        }}>
+                          ±{Math.round(p.sigma)}
+                        </div>
+                        <div className="lb-record">
+                          {p.wins}-{p.losses}
+                        </div>
+                        <div
+                          className="lb-wr"
+                          style={{
+                            color: parseInt(p.winRate, 10) >= 50 ? "var(--green)" : "var(--red)",
+                          }}
+                        >
+                          {p.winRate}%
+                        </div>
+                        <div>
+                          <Sparkline data={p.history} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </>
         )}
 
         {tab === "profile" && selectedPlayer && (() => {
@@ -1774,6 +2392,384 @@ export default function PadelMMR() {
             ))}
           </>
         )}
+
+        {tab === "diagnostics" && (() => {
+          const diag = computeDiagnostics(players);
+          const grade = (val, thresholds) => {
+            if (val >= thresholds[0]) return { label: "Excellent", color: "var(--green)" };
+            if (val >= thresholds[1]) return { label: "Good", color: "var(--accent)" };
+            if (val >= thresholds[2]) return { label: "Fair", color: "var(--text-secondary)" };
+            return { label: "Poor", color: "var(--red)" };
+          };
+
+          const r2Grade = grade(diag.r2, [0.9, 0.75, 0.5]);
+          const spearmanGrade = grade(diag.spearman, [0.9, 0.75, 0.5]);
+          const maeGrade = grade(1 - diag.mae / 500, [0.7, 0.5, 0.3]);
+          const convGrade = grade(parseInt(diag.convergePct, 10) / 100, [0.7, 0.5, 0.3]);
+
+          return (
+            <>
+              <div className="how-section">
+                <div className="how-title">System Quality Metrics</div>
+                <div style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+                  gap: 12,
+                  marginBottom: 24,
+                }}>
+                  {[
+                    { label: "R² (Variance Explained)", value: diag.r2.toFixed(4), g: r2Grade, desc: "How much of MMR variance is explained by true skill. Target: > 0.85" },
+                    { label: "Spearman Rank Corr.", value: diag.spearman.toFixed(4), g: spearmanGrade, desc: "Are players ranked in the right order? Target: > 0.90" },
+                    { label: "Mean Abs. Error", value: `${Math.round(diag.mae)} MMR`, g: maeGrade, desc: "Average gap between final MMR and true MMR target. Lower is better." },
+                    { label: "Convergence (±200)", value: `${diag.convergePct}% (${diag.converged}/${diag.n})`, g: convGrade, desc: "Players within 200 MMR of their true target." },
+                  ].map((m) => (
+                    <div key={m.label} style={{
+                      background: "var(--bg-card)",
+                      border: "1px solid var(--border)",
+                      borderRadius: 8,
+                      padding: "20px 20px 16px",
+                    }}>
+                      <div style={{
+                        fontFamily: "'JetBrains Mono', monospace",
+                        fontSize: 10,
+                        letterSpacing: 1.5,
+                        textTransform: "uppercase",
+                        color: "var(--text-muted)",
+                        marginBottom: 8,
+                      }}>{m.label}</div>
+                      <div style={{
+                        fontFamily: "'JetBrains Mono', monospace",
+                        fontSize: 24,
+                        fontWeight: 700,
+                        color: m.g.color,
+                        marginBottom: 4,
+                      }}>{m.value}</div>
+                      <div style={{
+                        fontSize: 12,
+                        fontWeight: 600,
+                        color: m.g.color,
+                        marginBottom: 8,
+                      }}>{m.g.label}</div>
+                      <div style={{
+                        fontSize: 11,
+                        color: "var(--text-muted)",
+                        lineHeight: 1.5,
+                      }}>{m.desc}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="how-section">
+                <div className="how-title">Regression Details</div>
+                <div className="how-card">
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                    gap: 16,
+                  }}>
+                    <div>
+                      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, color: "var(--text-muted)", letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Slope</div>
+                      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, fontWeight: 600, color: "var(--text-primary)" }}>{diag.slope.toFixed(2)}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>Expected ≈ 60 (MMR per skill point)</div>
+                    </div>
+                    <div>
+                      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, color: "var(--text-muted)", letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Intercept</div>
+                      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, fontWeight: 600, color: "var(--text-primary)" }}>{diag.intercept.toFixed(0)}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>Expected ≈ -400 (with slope ~60)</div>
+                    </div>
+                    <div>
+                      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, color: "var(--text-muted)", letterSpacing: 1, textTransform: "uppercase", marginBottom: 4 }}>Formula</div>
+                      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 500, color: "var(--accent)" }}>
+                        MMR = {diag.slope.toFixed(1)} × skill + {diag.intercept.toFixed(0)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="how-section">
+                <div className="how-title">
+                  True Skill vs Final MMR
+                  <span style={{ fontSize: 11, fontWeight: 400, color: "var(--text-muted)", marginLeft: 12 }}>
+                    <span style={{ color: "var(--accent)" }}>—</span> regression &nbsp;
+                    <span style={{ color: "rgba(34,197,94,0.5)" }}>- -</span> perfect &nbsp;
+                    <span style={{ color: "#22c55e" }}>●</span> &lt;100 err &nbsp;
+                    <span style={{ color: "#f59e0b" }}>●</span> &lt;200 err &nbsp;
+                    <span style={{ color: "#ef4444" }}>●</span> &gt;200 err
+                  </span>
+                </div>
+                <ScatterPlot players={players} diagnostics={diag} />
+              </div>
+
+              <div className="how-section">
+                <div className="how-title">Biggest Outliers</div>
+                <div style={{ display: "grid", gap: 8 }}>
+                  {diag.outliers.map((o) => (
+                    <div key={o.name} style={{
+                      background: "var(--bg-card)",
+                      border: "1px solid var(--border)",
+                      borderRadius: 6,
+                      padding: "12px 16px",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 12,
+                      flexWrap: "wrap",
+                    }}>
+                      <div>
+                        <span style={{ fontWeight: 600, fontSize: 14 }}>{o.name}</span>
+                        <span style={{
+                          fontFamily: "'JetBrains Mono', monospace",
+                          fontSize: 11,
+                          color: "var(--text-muted)",
+                          marginLeft: 12,
+                        }}>
+                          Target: {Math.round(o.trueMmr)} → Actual: {Math.round(o.mmr)}
+                        </span>
+                      </div>
+                      <div style={{
+                        fontFamily: "'JetBrains Mono', monospace",
+                        fontSize: 14,
+                        fontWeight: 600,
+                        color: o.diff > 0 ? "var(--green)" : "var(--red)",
+                      }}>
+                        {o.diff > 0 ? "+" : ""}{Math.round(o.diff)} MMR off
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="how-section">
+                <div className="how-title">What These Numbers Mean</div>
+                <div className="how-card">
+                  <h4>R² (Coefficient of Determination)</h4>
+                  <p>
+                    Measures how much of the variation in final MMR is explained by true skill.
+                    A value of 1.0 means perfect prediction. Below 0.75 means the system is not
+                    reliably separating players by skill.
+                  </p>
+                </div>
+                <div className="how-card">
+                  <h4>Spearman Rank Correlation</h4>
+                  <p>
+                    Checks if the ordering is correct regardless of exact numbers. Even if MMR
+                    values are compressed, a high Spearman means the best players are still
+                    ranked above the worst. Target: above 0.90.
+                  </p>
+                </div>
+                <div className="how-card">
+                  <h4>Mean Absolute Error</h4>
+                  <p>
+                    Average difference between each player's final MMR and their true skill
+                    target in MMR units. Lower is better. Under 100 is strong; over 200 means
+                    significant misranking.
+                  </p>
+                </div>
+                <div className="how-card">
+                  <h4>Convergence</h4>
+                  <p>
+                    Percentage of players whose final MMR is within 200 points of their true
+                    target. Higher means the system is placing more players correctly. Over 70%
+                    is a good sign after 100 games per player.
+                  </p>
+                </div>
+              </div>
+            </>
+          );
+        })()}
+
+        {tab === "compare" && (() => {
+          const diagV4 = computeDiagnostics(players);
+          const diagG2 = computeG2Diagnostics(g2sim.players);
+
+          const grade = (val, thresholds) => {
+            if (val >= thresholds[0]) return { label: "Excellent", color: "var(--green)" };
+            if (val >= thresholds[1]) return { label: "Good", color: "var(--accent)" };
+            if (val >= thresholds[2]) return { label: "Fair", color: "var(--text-secondary)" };
+            return { label: "Poor", color: "var(--red)" };
+          };
+
+          const metrics = [
+            { label: "R²", v4: diagV4.r2.toFixed(4), g2: diagG2.r2.toFixed(4), v4g: grade(diagV4.r2, [0.9, 0.75, 0.5]), g2g: grade(diagG2.r2, [0.9, 0.75, 0.5]), better: diagG2.r2 > diagV4.r2 ? "g2" : diagV4.r2 > diagG2.r2 ? "v4" : "tie" },
+            { label: "Spearman", v4: diagV4.spearman.toFixed(4), g2: diagG2.spearman.toFixed(4), v4g: grade(diagV4.spearman, [0.9, 0.75, 0.5]), g2g: grade(diagG2.spearman, [0.9, 0.75, 0.5]), better: diagG2.spearman > diagV4.spearman ? "g2" : diagV4.spearman > diagG2.spearman ? "v4" : "tie" },
+            { label: "MAE", v4: `${Math.round(diagV4.mae)}`, g2: `${Math.round(diagG2.mae)}`, v4g: grade(1 - diagV4.mae / 500, [0.7, 0.5, 0.3]), g2g: grade(1 - diagG2.mae / 500, [0.7, 0.5, 0.3]), better: diagG2.mae < diagV4.mae ? "g2" : diagV4.mae < diagG2.mae ? "v4" : "tie" },
+            { label: "Convergence", v4: `${diagV4.convergePct}%`, g2: `${diagG2.convergePct}%`, v4g: grade(parseInt(diagV4.convergePct) / 100, [0.7, 0.5, 0.3]), g2g: grade(parseInt(diagG2.convergePct) / 100, [0.7, 0.5, 0.3]), better: parseInt(diagG2.convergePct) > parseInt(diagV4.convergePct) ? "g2" : parseInt(diagV4.convergePct) > parseInt(diagG2.convergePct) ? "v4" : "tie" },
+            { label: "Slope", v4: diagV4.slope.toFixed(1), g2: diagG2.slope.toFixed(1), v4g: grade(1 - Math.abs(diagV4.slope - 60) / 60, [0.7, 0.5, 0.3]), g2g: grade(1 - Math.abs(diagG2.slope - 60) / 60, [0.7, 0.5, 0.3]), better: Math.abs(diagG2.slope - 60) < Math.abs(diagV4.slope - 60) ? "g2" : "v4" },
+          ];
+
+          const v4Wins = metrics.filter((m) => m.better === "v4").length;
+          const g2Wins = metrics.filter((m) => m.better === "g2").length;
+
+          const g2sorted = [...g2sim.players].sort((a, b) => b.mu - a.mu);
+
+          return (
+            <>
+              <div className="how-section">
+                <div className="how-title">
+                  V4 Elo vs Bayesian (μ/σ) — Head to Head
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 400, color: "var(--text-muted)", marginLeft: 12 }}>
+                    Seed: {seed}
+                  </span>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
+                  <div style={{
+                    background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 8, padding: 20, textAlign: "center",
+                    borderColor: v4Wins > g2Wins ? "var(--accent)" : "var(--border)",
+                  }}>
+                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: 1.5, color: "var(--text-muted)", marginBottom: 8 }}>V4 ELO SYSTEM</div>
+                    <div style={{ fontSize: 28, fontWeight: 700, color: v4Wins > g2Wins ? "var(--accent)" : "var(--text-secondary)" }}>{v4Wins} wins</div>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>{totalMatches} matches · K: {K_CALIBRATION}/{BASE_K}/{K_VETERAN}</div>
+                  </div>
+                  <div style={{
+                    background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 8, padding: 20, textAlign: "center",
+                    borderColor: g2Wins > v4Wins ? "var(--blue)" : "var(--border)",
+                  }}>
+                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: 1.5, color: "var(--text-muted)", marginBottom: 8 }}>BAYESIAN μ/σ SYSTEM</div>
+                    <div style={{ fontSize: 28, fontWeight: 700, color: g2Wins > v4Wins ? "var(--blue)" : "var(--text-secondary)" }}>{g2Wins} wins</div>
+                    <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>{g2sim.totalMatches} matches · Avg σ: {diagG2.avgSigma}</div>
+                  </div>
+                </div>
+
+                <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 8, overflow: "hidden" }}>
+                  <div style={{
+                    display: "grid", gridTemplateColumns: "120px 1fr 40px 1fr", gap: 0,
+                    padding: "10px 16px", fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: 1.5, color: "var(--text-muted)",
+                    borderBottom: "1px solid var(--border)",
+                  }}>
+                    <div>METRIC</div>
+                    <div style={{ textAlign: "center" }}>V4 ELO</div>
+                    <div />
+                    <div style={{ textAlign: "center" }}>BAYESIAN</div>
+                  </div>
+                  {metrics.map((m) => (
+                    <div key={m.label} style={{
+                      display: "grid", gridTemplateColumns: "120px 1fr 40px 1fr", gap: 0,
+                      padding: "12px 16px", borderBottom: "1px solid rgba(42,46,56,0.5)", alignItems: "center",
+                    }}>
+                      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 600 }}>{m.label}</div>
+                      <div style={{ textAlign: "center" }}>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 16, fontWeight: 600, color: m.v4g.color }}>{m.v4}</span>
+                        <span style={{ fontSize: 10, color: m.v4g.color, marginLeft: 6 }}>{m.v4g.label}</span>
+                      </div>
+                      <div style={{ textAlign: "center", fontSize: 14, fontWeight: 700, color: m.better === "v4" ? "var(--accent)" : m.better === "g2" ? "var(--blue)" : "var(--text-muted)" }}>
+                        {m.better === "v4" ? "◀" : m.better === "g2" ? "▶" : "="}
+                      </div>
+                      <div style={{ textAlign: "center" }}>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 16, fontWeight: 600, color: m.g2g.color }}>{m.g2}</span>
+                        <span style={{ fontSize: 10, color: m.g2g.color, marginLeft: 6 }}>{m.g2g.label}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="how-section">
+                <div className="how-title">Scatter Plots — Side by Side</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                  <div>
+                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: 1.5, color: "var(--accent)", marginBottom: 8, textAlign: "center" }}>V4 ELO</div>
+                    <ScatterPlot players={players} diagnostics={diagV4} />
+                  </div>
+                  <div>
+                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: 1.5, color: "var(--blue)", marginBottom: 8, textAlign: "center" }}>BAYESIAN μ/σ</div>
+                    <ScatterPlot players={g2sim.players} diagnostics={diagG2} />
+                  </div>
+                </div>
+              </div>
+
+              <div className="how-section">
+                <div className="how-title">Bayesian Leaderboard (μ − {G2_DISPLAY_K}σ display rating)</div>
+                <div className="lb-wrap">
+                  <div className="lb-table">
+                    <div className="lb-header" style={{ gridTemplateColumns: "44px 1fr 90px 90px 80px 70px 60px 120px" }}>
+                      <div>#</div>
+                      <div>Player</div>
+                      <div>μ (Skill)</div>
+                      <div>Display</div>
+                      <div>σ (Uncert.)</div>
+                      <div>Record</div>
+                      <div>WR%</div>
+                      <div>Trend</div>
+                    </div>
+                    {g2sorted.map((p, i) => {
+                      const [, , rankColor] = getRank(p.mu);
+                      return (
+                        <div key={p.id} className="lb-row" style={{ gridTemplateColumns: "44px 1fr 90px 90px 80px 70px 60px 120px", cursor: "default" }}>
+                          <div className={`lb-rank ${i < 3 ? "top-3" : ""}`}>{i + 1}</div>
+                          <div className="lb-player">
+                            <RankBadge mmr={p.mu} size={26} />
+                            <div>
+                              <div className="lb-name">{p.name}</div>
+                              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 9, color: "var(--text-muted)" }}>
+                                True: {Math.round(p.trueMmr)}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="lb-mmr" style={{ color: rankColor }}>{Math.round(p.mu)}</div>
+                          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 600, color: "var(--blue)" }}>{Math.round(p.displayRating)}</div>
+                          <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: p.sigma > 200 ? "var(--red)" : p.sigma > 100 ? "var(--accent)" : "var(--green)" }}>
+                            ±{Math.round(p.sigma)}
+                          </div>
+                          <div className="lb-record">{p.wins}-{p.losses}</div>
+                          <div className="lb-wr" style={{ color: parseInt(p.winRate, 10) >= 50 ? "var(--green)" : "var(--red)" }}>{p.winRate}%</div>
+                          <div><Sparkline data={p.history} /></div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="how-section">
+                <div className="how-title">How the Bayesian System Differs</div>
+                <div className="how-card">
+                  <h4>μ (mu) and σ (sigma) instead of single MMR</h4>
+                  <p>
+                    Each player has two numbers: μ is the skill estimate and σ is how uncertain
+                    the system is. New players start with high σ ({G2_SIGMA_START}) so their rating
+                    moves fast. As they play, σ shrinks (floor: {G2_SIGMA_FLOOR}) and results matter less.
+                  </p>
+                </div>
+                <div className="how-card">
+                  <h4>Display Rating: μ − {G2_DISPLAY_K}σ</h4>
+                  <p>
+                    The visible rating is conservative — it subtracts uncertainty. A player
+                    who has played 3 games at μ=1200 with σ=300 shows as {Math.round(1200 - G2_DISPLAY_K * 300)}.
+                    A player at μ=1200 with σ=80 after 200 games shows as {Math.round(1200 - G2_DISPLAY_K * 80)}.
+                    You earn your visible rank through consistent play.
+                  </p>
+                </div>
+                <div className="how-card">
+                  <h4>Individual Skill Decoupling</h4>
+                  <p>
+                    Updates weight individual skill at {(G2_INDIVIDUAL_WEIGHT * 100).toFixed(0)}%
+                    and teammate contribution at {((1 - G2_INDIVIDUAL_WEIGHT) * 100).toFixed(0)}%.
+                    Your rating is less hostage to your partner compared to the V4 system.
+                  </p>
+                </div>
+                <div className="how-card">
+                  <h4>Margin as Evidence, Not Multiplier</h4>
+                  <p>
+                    Match margins affect both the skill shift and the confidence gain. A stomp
+                    provides strong evidence ({G2_MARGIN_EVIDENCE.stomp}) — it moves μ more AND reduces σ
+                    faster. A close game ({G2_MARGIN_EVIDENCE.close}) is weak evidence that barely
+                    changes confidence.
+                  </p>
+                </div>
+                <div className="how-card">
+                  <h4>Probe Matchmaking</h4>
+                  <p>
+                    Players with high uncertainty (σ &gt; 200) are occasionally matched against more
+                    diverse opponents specifically to gather diagnostic signal about where they really belong.
+                  </p>
+                </div>
+              </div>
+            </>
+          );
+        })()}
 
         {tab === "how it works" && (
           <>
