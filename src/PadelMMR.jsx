@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useMemo } from "react";
 const NUM_PLAYERS = 40;
 const GAMES_PER_PLAYER_TARGET = 300;
 const CALIBRATION_GAMES = 8;
-const MMR_START = 0;
+const MMR_START = 700;
 const BASE_K = 40;
 const K_CALIBRATION = 96;
 const K_VETERAN = 48;
