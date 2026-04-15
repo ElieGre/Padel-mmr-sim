@@ -3,8 +3,8 @@ import { useState, useEffect, useRef, useMemo } from "react";
 // ─── MMR Engine (V4 Core Logic) ───────────────────────────────────────
 const NUM_PLAYERS = 40;
 const GAMES_PER_PLAYER_TARGET = 300;
-const CALIBRATION_GAMES = 20;
-const MMR_START = 300;
+const CALIBRATION_GAMES = 8;
+const MMR_START = 0;
 const BASE_K = 40;
 const K_CALIBRATION = 96;
 const K_VETERAN = 48;
@@ -26,12 +26,24 @@ const PERF_THRESHOLDS = [
 ];
 
 const RANK_TIERS = [
-  [0,    "F",  "#CD5C5C", "F"],
-  [350,  "D",  "#CD853F", "D"],
-  [700,  "C",  "#4169E1", "C"],
-  [1100, "B",  "#32CD32", "B"],
-  [1500, "A",  "#FFD700", "A"],
-  [1900, "A+", "#FF4500", "A+"],
+  [0, "Bronze III", "#8B6914", "I"],
+  [600, "Bronze II", "#A07828", "II"],
+  [750, "Bronze I", "#CD9B1D", "III"],
+  [900, "Silver III", "#8A939B", "IV"],
+  [1000, "Silver II", "#A8B4BE", "V"],
+  [1100, "Silver I", "#C0CDD8", "VI"],
+  [1250, "Gold III", "#B8860B", "VII"],
+  [1400, "Gold II", "#DAA520", "VIII"],
+  [1550, "Gold I", "#FFD700", "IX"],
+  [1700, "Plat III", "#4A8B8B", "X"],
+  [1850, "Plat II", "#5CACAC", "XI"],
+  [2000, "Plat I", "#7FFFFF", "XII"],
+  [2200, "Dia III", "#4169E1", "XIII"],
+  [2400, "Dia II", "#6495ED", "XIV"],
+  [2600, "Dia I", "#87CEEB", "XV"],
+  [2800, "Champion", "#DA70D6", "XVI"],
+  [3000, "Grand Champ", "#FF4500", "XVII"],
+  [3500, "Legend", "#FF0000", "XVIII"],
 ];
 
 const NAMES = [
@@ -39,8 +51,7 @@ const NAMES = [
   "Pablo", "Elena", "Karim", "Leila", "Marco", "Ana", "Hassan", "Marta",
   "Diego", "Clara", "Sami", "Yasmin", "Jorge", "Lucia", "Rami", "Sara",
   "Mateo", "Julia", "Fadi", "Rita", "Elie", "Maya", "Leo", "Ines",
-  "Alex", "Dina", "Hugo", "Layla", "Rayan", "Nour", "Tomas", "Zara",
-  "Sam", "Nina", "Felix", "Petra"
+  "Alex", "Dina", "Hugo", "Layla", "Rayan", "Nour", "Tomas", "Zara"
 ];
 
 function getRank(mmr) {
@@ -63,19 +74,24 @@ function seededRandom(seed) {
   };
 }
 
+function gaussianRandom(rng) {
+  let u = 0, v = 0;
+  while (u === 0) u = rng();
+  while (v === 0) v = rng();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
 
-function createPlayer(id, name, trueSkill, startMmr = 0) {
+function createPlayer(id, name, trueSkill) {
   return {
     id,
     name,
     trueSkill,
-    mmr: startMmr,
-    startMmr,
+    mmr: MMR_START,
     gamesPlayed: 0,
     wins: 0,
     losses: 0,
     streak: 0,
-    peakMmr: startMmr,
+    peakMmr: MMR_START,
     recentOpponents: [],
     recentResults: [],
     history: [],
@@ -132,7 +148,7 @@ function createPlayer(id, name, trueSkill, startMmr = 0) {
       return getRank(this.mmr);
     },
     get trueMmr() {
-      return ((this.trueSkill - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 2000;
+      return 200 + ((this.trueSkill - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 1800;
     },
     get winRate() {
       return this.gamesPlayed > 0 ? ((this.wins / this.gamesPlayed) * 100).toFixed(0) : "0";
@@ -143,7 +159,7 @@ function createPlayer(id, name, trueSkill, startMmr = 0) {
 function simulateMatch(teamA, teamB, rng) {
   const a = teamA.reduce((s, p) => s + p.trueSkill, 0);
   const b = teamB.reduce((s, p) => s + p.trueSkill, 0);
-  const pa = 1 / (1 + Math.pow(10, (b - a) / 12));
+  const pa = 1 / (1 + Math.pow(10, (b - a) / (400 / 15)));
   return rng() < pa ? 0 : 1;
 }
 
@@ -209,12 +225,12 @@ function calcMmrChanges(teamA, teamB, winner, margin) {
   for (const p of lt) {
     const k = p.kFactor;
     let loss = k * (1.0 - expW) * lam * mm;
-    let loss = k * (1.0 - expW) * lam * mm;
     const tm = lt.find((t) => t.id !== p.id);
     if (tm) {
       const ta = Math.max(0.8, Math.min(1.2, 1.0 + ((p.mmr - tm.mmr) / 100) * TEAMMATE_DIFF_FACTOR));
       loss *= ta;
     }
+    if (p.streak < -3) loss *= 0.85;
     // Performance shield: high WR players lose less on occasional losses
     loss *= p.performanceLossShield;
     loss *= p.performanceMultiplier;
@@ -288,32 +304,17 @@ function runSimulation(seed = 42) {
   const rng = seededRandom(seed);
   const skills = [];
 
-  // Exact pool: 3A 7B 14C 15D 5F = 44 players
-  const gradeConfig = [
-    { count: 3,  min: 33, max: 40 },  // A
-    { count: 7,  min: 26, max: 33 },  // B
-    { count: 14, min: 20, max: 26 },  // C
-    { count: 15, min: 14, max: 20 },  // D
-    { count: 5,  min: 10, max: 14 },  // F
-  ];
-  for (const g of gradeConfig) {
-    for (let j = 0; j < g.count; j++) {
-      let s = g.min + rng() * (g.max - g.min);
-      skills.push(Math.max(TRUE_SKILL_MIN, Math.min(TRUE_SKILL_MAX, s)));
-    }
-  }
-  // Fisher-Yates shuffle
-  for (let i = skills.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [skills[i], skills[j]] = [skills[j], skills[i]];
+  for (let i = 0; i < NUM_PLAYERS; i++) {
+    const r = rng();
+    const tier = r < 0.25 ? "b" : r < 0.75 ? "i" : "a";
+    const means = { b: 15, i: 25, a: 35 };
+    const stds = { b: 2.5, i: 3, a: 2.5 };
+    let s = means[tier] + gaussianRandom(rng) * stds[tier];
+    s = Math.max(TRUE_SKILL_MIN, Math.min(TRUE_SKILL_MAX, s));
+    skills.push(s);
   }
 
-  const players = skills.map((s, i) => {
-    const trueMmr = ((s - TRUE_SKILL_MIN) / (TRUE_SKILL_MAX - TRUE_SKILL_MIN)) * 2000;
-    const noise = (rng() - 0.5) * 300; // +-150 MMR noise around true level
-    const startMmr = Math.max(0, Math.round(trueMmr + noise));
-    return createPlayer(i, NAMES[i], s, startMmr);
-  });
+  const players = skills.map((s, i) => createPlayer(i, NAMES[i], s));
   const matches = [];
   let gc = 0;
   let cp = 0;
@@ -810,46 +811,61 @@ function RankBadge({ mmr, size = 32 }) {
   const tierGroup = name.split(" ")[0];
 
   const shapes = {
-    F: (
-      <g>
-        <circle cx="16" cy="16" r="12" fill="none" stroke={color} strokeWidth="2" opacity="0.5" />
-        <line x1="10" y1="10" x2="22" y2="22" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
-        <line x1="22" y1="10" x2="10" y2="22" stroke={color} strokeWidth="2.5" strokeLinecap="round" />
-      </g>
-    ),
-    D: (
+    Bronze: (
       <g>
         <circle cx="16" cy="16" r="12" fill="none" stroke={color} strokeWidth="2" opacity="0.6" />
-        <circle cx="16" cy="16" r="6" fill={color} opacity="0.7" />
+        <circle cx="16" cy="16" r="6" fill={color} opacity="0.8" />
       </g>
     ),
-    C: (
+    Silver: (
       <g>
-        <polygon points="16,2 28,16 16,30 4,16" fill="none" stroke={color} strokeWidth="2" opacity="0.6" />
-        <polygon points="16,8 22,16 16,24 10,16" fill={color} opacity="0.85" />
+        <polygon points="16,4 20,14 16,12 12,14" fill={color} opacity="0.8" />
+        <polygon points="16,28 20,18 16,20 12,18" fill={color} opacity="0.8" />
+        <circle cx="16" cy="16" r="4" fill={color} />
       </g>
     ),
-    B: (
+    Gold: (
       <g>
-        <polygon points="16,2 20,12 30,12 22,18 25,28 16,22 7,28 10,18 2,12 12,12" fill={color} opacity="0.9" />
+        <polygon points="16,2 20,12 28,12 22,18 24,28 16,22 8,28 10,18 4,12 12,12" fill={color} opacity="0.9" />
       </g>
     ),
-    A: (
+    Plat: (
+      <g>
+        <polygon points="16,3 19,13 29,13 21,19 24,29 16,23 8,29 11,19 3,13 13,13" fill="none" stroke={color} strokeWidth="1.5" />
+        <polygon points="16,8 18,14 24,14 19,18 21,24 16,20 11,24 13,18 8,14 14,14" fill={color} opacity="0.8" />
+      </g>
+    ),
+    Dia: (
       <g>
         <polygon points="16,2 28,16 16,30 4,16" fill={color} opacity="0.3" />
         <polygon points="16,6 24,16 16,26 8,16" fill={color} opacity="0.7" />
         <polygon points="16,10 20,16 16,22 12,16" fill={color} />
       </g>
     ),
-    "A+": (
+    Champion: (
       <g>
-        <polygon points="16,0 19,10 30,10 21,17 24,28 16,21 8,28 11,17 2,10 13,10" fill={color} />
-        <polygon points="16,5 18,12 24,12 19,16 21,23 16,19 11,23 13,16 8,12 14,12" fill="#fff" opacity="0.4" />
+        <polygon points="16,1 20,11 30,11 22,18 25,28 16,22 7,28 10,18 2,11 12,11" fill={color} />
+        <circle cx="16" cy="14" r="3" fill="#fff" opacity="0.5" />
+      </g>
+    ),
+    Grand: (
+      <g>
+        <polygon points="16,0 19,10 30,10 21,17 24,28 16,21 8,28 11,17 2,10 13,10" fill="#FF4500" />
+        <polygon points="16,5 18,12 24,12 19,16 21,23 16,19 11,23 13,16 8,12 14,12" fill="#FFD700" />
+      </g>
+    ),
+    Legend: (
+      <g>
+        <circle cx="16" cy="16" r="14" fill="none" stroke="#FF0000" strokeWidth="2">
+          <animateTransform attributeName="transform" type="rotate" from="0 16 16" to="360 16 16" dur="8s" repeatCount="indefinite" />
+        </circle>
+        <polygon points="16,2 20,12 30,12 22,18 25,28 16,22 7,28 10,18 2,12 12,12" fill="#FF0000" />
+        <polygon points="16,7 18,13 24,13 19,17 21,23 16,19 11,23 13,17 8,13 14,13" fill="#FFD700" />
       </g>
     ),
   };
 
-  const shape = shapes[tierGroup] || shapes.F;
+  const shape = shapes[tierGroup] || shapes.Bronze;
 
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" style={{ flexShrink: 0 }}>
@@ -990,9 +1006,9 @@ body {
 
 .hero-stats {
   display: grid;
-  grid-template-columns: repeat(5, minmax(80px, 1fr));
+  grid-template-columns: repeat(4, minmax(80px, 1fr));
   gap: 20px;
-  max-width: 820px;
+  max-width: 720px;
   margin: 0 auto;
 }
 
@@ -1662,7 +1678,7 @@ body {
 `;
 
 // ─── Full-width MMR Chart using Canvas ────────────────────────────────
-function MmrChart({ history, trueMmr, startMmr = 0 }) {
+function MmrChart({ history, trueMmr }) {
   const canvasRef = useRef(null);
 
   useEffect(() => {
@@ -1682,7 +1698,7 @@ function MmrChart({ history, trueMmr, startMmr = 0 }) {
     const pad = { top: 20, right: 26, bottom: 28, left: 50 };
 
     const mmrs = history.map((d) => d.mmr);
-    const allVals = [...mmrs, trueMmr, startMmr];
+    const allVals = [...mmrs, trueMmr, MMR_START];
     const minV = Math.min(...allVals) - 30;
     const maxV = Math.max(...allVals) + 30;
     const rangeV = maxV - minV || 1;
@@ -1725,7 +1741,7 @@ function MmrChart({ history, trueMmr, startMmr = 0 }) {
     ctx.textAlign = "left";
     ctx.fillText("TRUE", W - pad.right + 4, trueY + 3);
 
-    const startY = toY(startMmr);
+    const startY = toY(MMR_START);
     ctx.setLineDash([2, 4]);
     ctx.strokeStyle = "rgba(138,143,168,0.2)";
     ctx.lineWidth = 1;
@@ -1736,7 +1752,7 @@ function MmrChart({ history, trueMmr, startMmr = 0 }) {
     ctx.setLineDash([]);
 
     const last = mmrs[mmrs.length - 1];
-    const lineColor = last >= startMmr ? "#22c55e" : "#ef4444";
+    const lineColor = last >= MMR_START ? "#22c55e" : "#ef4444";
     ctx.strokeStyle = lineColor;
     ctx.lineWidth = 2;
     ctx.lineJoin = "round";
@@ -1752,7 +1768,7 @@ function MmrChart({ history, trueMmr, startMmr = 0 }) {
     ctx.stroke();
 
     const gradient = ctx.createLinearGradient(0, toY(maxV), 0, toY(minV));
-    gradient.addColorStop(0, last >= startMmr ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)");
+    gradient.addColorStop(0, last >= MMR_START ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)");
     gradient.addColorStop(1, "rgba(0,0,0,0)");
 
     ctx.fillStyle = gradient;
@@ -2125,7 +2141,7 @@ export default function PadelMMR() {
           }
 
           const [, rankName, rankColor] = p.rank;
-          const delta = p.mmr - p.startMmr;
+          const delta = p.mmr - MMR_START;
           const playerMatches = matches
             .filter((m) => m.teamA.some((t) => t.id === p.id) || m.teamB.some((t) => t.id === p.id))
             .reverse();
@@ -2217,7 +2233,7 @@ export default function PadelMMR() {
                   <div className="profile-chart-title">
                     MMR History <span style={{ opacity: 0.5 }}>(dashed = true skill target)</span>
                   </div>
-                  <MmrChart history={p.history} trueMmr={p.trueMmr} startMmr={p.startMmr} />
+                  <MmrChart history={p.history} trueMmr={p.trueMmr} />
                 </div>
               </div>
 
@@ -2922,12 +2938,8 @@ export default function PadelMMR() {
                 </p>
               </div>
 
-        {tab === "how it works" && (
-          <>
-            <div className="how-section">
-              <div className="how-title">Start Here</div>
               <div className="how-card">
-                <h4>What this page is showing</h4>
+                <h4>Score Margin</h4>
                 <p>
                   Score margin means how convincing the win was.
                 </p>
@@ -2946,8 +2958,9 @@ export default function PadelMMR() {
                   • Close win = <code>{MARGIN_MULTIPLIERS.close}x</code>
                 </p>
               </div>
+
               <div className="how-card">
-                <h4>What "simulation" means here</h4>
+                <h4>Teammate Adjustment</h4>
                 <p>
                   This system also looks at the MMR difference between teammates.
                 </p>
@@ -2961,6 +2974,7 @@ export default function PadelMMR() {
                   player had on their own team.
                 </p>
               </div>
+
               <div className="how-card">
                 <h4>Streak</h4>
                 <p>
@@ -3035,7 +3049,7 @@ export default function PadelMMR() {
             <div className="how-section">
               <div className="how-title">How to Read Each Part of the Page</div>
               <div className="how-card">
-                <h4>Expected Result & Upset Bonus</h4>
+                <h4>Leaderboard</h4>
                 <p>
                   The leaderboard shows the current rating order from highest MMR to lowest
                   MMR.
@@ -3054,7 +3068,7 @@ export default function PadelMMR() {
               </div>
 
               <div className="how-card">
-                <h4>Score Margin</h4>
+                <h4>Player Profile</h4>
                 <p>
                   Clicking a player opens a more detailed profile.
                 </p>
@@ -3085,7 +3099,7 @@ export default function PadelMMR() {
               </div>
 
               <div className="how-card">
-                <h4>Streak Bonus</h4>
+                <h4>Match History</h4>
                 <p>
                   This shows individual match results and the exact MMR gained or lost by each
                   player in that match.
